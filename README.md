@@ -1,11 +1,11 @@
 # CTTS — CNN Train Tools Set
 
-视觉 CNN 训练全流程工具集：数据准备 → 标注管理 → YOLO 训练 → 推理验证。
+视觉 CNN 训练全流程工具集：数据准备 → 标注管理 → YOLO训练 → 推理验证。
 
 ## 项目结构
 
 ```
-vision/
+ctts/
 ├── tools/                  # 工具脚本
 │   ├── ctts.py            # ★ 统一入口（CLI + GUI）
 │   ├── dataset_build.py   # 视频抽帧 + 质量过滤
@@ -33,7 +33,7 @@ vision/
 ### 环境配置
 
 ```bash
-cd vision/tools/
+cd ctts/tools/
 
 # 安装依赖（需 uv）
 uv venv ~/.cache/ctts-venv

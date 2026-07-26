@@ -1,8 +1,10 @@
 from pathlib import Path
 from ultralytics.models.yolo import YOLO
 
-SOURCE_WEIGHT = "/home/ryanz/eDisk/nuedc/26/vision/weights/yolo26n.pt"
-DATASET_DIR = "/home/ryanz/eDisk/nuedc/26/vision/dataset/LabelData/data.yaml"
+import os as _os
+_PROJECT_ROOT = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+SOURCE_WEIGHT = _os.path.join(_PROJECT_ROOT, "weights", "yolo26n.pt")
+DATASET_DIR = _os.path.join(_PROJECT_ROOT, "dataset", "LabelData", "data.yaml")
 FREEZE_LAYERS = 6
 
 

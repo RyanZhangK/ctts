@@ -12,8 +12,9 @@ weights/*.pth
 weights/*.onnx
 weights/*.engine
 
-# 数据集（太大，不纳入版本控制）
-# 仅保留 data.yaml classes.txt notes.json 等配置文件
+# 数据集图片与标签（太大，不纳入版本控制）
+dataset/*/images/
+dataset/*/labels/
 dataset/*/train/
 dataset/*/val/
 dataset/RawData/
