@@ -35,14 +35,12 @@ def cli_main():
     sub = parser.add_subparsers(dest="module", help="功能模块")
 
     # ---- data ----
-    p_data = sub.add_parser("data", help="数据准备（抽帧 / 质量过滤 / 数据集划分）")
+    p_data = sub.add_parser("data", help="数据准备（视频抽帧 / 数据集划分）")
     p_data_sub = p_data.add_subparsers(dest="action", help="子命令")
 
-    p_data_sub.add_parser("build", help="视频抽帧 → dataset_build").add_argument(
+    p_data_sub.add_parser("build", help="视频抽帧 + 质量过滤").add_argument(
         "args", nargs=argparse.REMAINDER, help="dataset_build 参数")
-    p_data_sub.add_parser("filter", help="质量过滤 → filter_quality").add_argument(
-        "args", nargs=argparse.REMAINDER, help="filter_quality 参数")
-    p_data_sub.add_parser("split", help="数据集划分 → split_dataset").add_argument(
+    p_data_sub.add_parser("split", help="数据集划分").add_argument(
         "args", nargs=argparse.REMAINDER, help="split_dataset 参数")
 
     # ---- label ----
@@ -78,7 +76,6 @@ def cli_main():
         extra = getattr(args, "args", [])
         _forward_to_module({
             "build": "dataset_build",
-            "filter": "filter_quality",
             "split": "split_dataset",
         }, args.action, parser, extra_args=extra)
 
@@ -210,28 +207,28 @@ def gui_main():
             layout = QVBoxLayout(central)
 
             tabs = QTabWidget()
-            tabs.addTab(self._build_data_tab(), "📦 数据准备")
-            tabs.addTab(self._build_label_tab(), "🏷️ 标注管理")
-            tabs.addTab(self._build_train_tab(), "🚀 训练")
-            tabs.addTab(self._build_detect_tab(), "🔍 推理")
+            tabs.addTab(self._build_data_tab(), "① 数据准备")
+            tabs.addTab(self._build_label_tab(), "② 标注管理")
+            tabs.addTab(self._build_split_tab(), "③ 数据集划分")
+            tabs.addTab(self._build_train_tab(), "④ 训练")
+            tabs.addTab(self._build_detect_tab(), "⑤ 推理")
             layout.addWidget(tabs)
 
         # ============================================================
-        # 数据准备 Tab
+        # ① 数据准备 Tab
         # ============================================================
         def _build_data_tab(self) -> QWidget:
             w = QWidget()
             layout = QVBoxLayout(w)
 
-            # -- 抽帧 --
-            grp_build = QGroupBox("视频抽帧 (dataset_build)")
+            grp_build = QGroupBox("视频抽帧 + 质量过滤")
             fl = QFormLayout(grp_build)
             self._build_video = QLineEdit()
-            self._build_video.setPlaceholderText("选择视频文件...")
+            self._build_video.setPlaceholderText("选择视频文件（可多选）...")
             row = QHBoxLayout()
             row.addWidget(self._build_video)
             btn = QPushButton("浏览")
-            btn.clicked.connect(lambda: self._browse_file(self._build_video, "视频 (*.mp4 *.avi *.mov)"))
+            btn.clicked.connect(lambda: self._browse_files(self._build_video, "视频 (*.mp4 *.avi *.mov *.mkv)"))
             row.addWidget(btn)
             fl.addRow("视频:", row)
 
@@ -243,114 +240,95 @@ def gui_main():
             self._build_interval.setSuffix(" 秒")
             fl.addRow("间隔:", self._build_interval)
 
+            # 质量过滤参数
+            self._build_lap = QDoubleSpinBox()
+            self._build_lap.setRange(0, 1000)
+            self._build_lap.setValue(50)
+            fl.addRow("清晰度下限:", self._build_lap)
+
+            self._build_entropy = QDoubleSpinBox()
+            self._build_entropy.setRange(0, 10)
+            self._build_entropy.setValue(3.0)
+            self._build_entropy.setSingleStep(0.5)
+            fl.addRow("对比度下限:", self._build_entropy)
+
+            self._build_min_brt = QDoubleSpinBox()
+            self._build_min_brt.setRange(0, 255)
+            self._build_min_brt.setValue(10)
+            fl.addRow("亮度下限:", self._build_min_brt)
+
+            self._build_max_brt = QDoubleSpinBox()
+            self._build_max_brt.setRange(0, 255)
+            self._build_max_brt.setValue(245)
+            fl.addRow("亮度上限:", self._build_max_brt)
+
             btn_build = QPushButton("开始抽帧")
+            btn_build.setStyleSheet("font-size: 14px; padding: 8px;")
             btn_build.clicked.connect(self._run_build)
             fl.addRow(btn_build)
             layout.addWidget(grp_build)
+            layout.addStretch()
+            return w
 
-            # -- 质量过滤 --
-            grp_filter = QGroupBox("质量过滤 (filter_quality)")
-            fl2 = QFormLayout(grp_filter)
-            self._filter_dir = QLineEdit()
-            self._filter_dir.setPlaceholderText("选择图片目录...")
-            row2 = QHBoxLayout()
-            row2.addWidget(self._filter_dir)
-            btn = QPushButton("浏览")
-            btn.clicked.connect(lambda: self._browse_dir(self._filter_dir))
-            row2.addWidget(btn)
-            fl2.addRow("目录:", row2)
+        def _run_build(self):
+            video_text = self._build_video.text().strip()
+            output = self._build_output.text().strip()
+            interval = self._build_interval.value()
+            lap = self._build_lap.value()
+            ent = self._build_entropy.value()
+            min_b = self._build_min_brt.value()
+            max_b = self._build_max_brt.value()
+            if not video_text:
+                QMessageBox.warning(self, "提示", "请选择视频文件")
+                return
+            videos = [v.strip() for v in video_text.split(";") if v.strip()]
+            self._run_worker(
+                lambda: self._do_build(videos, output, interval, lap, ent, min_b, max_b),
+                lambda msg: QMessageBox.information(self, "完成", str(msg)),
+                "抽帧中",
+            )
 
-            self._filter_laplacian = QDoubleSpinBox()
-            self._filter_laplacian.setRange(0, 1000)
-            self._filter_laplacian.setValue(50)
-            fl2.addRow("清晰度阈值:", self._filter_laplacian)
+        def _do_build(self, videos, output, interval, lap, ent, min_b, max_b):
+            import io
+            from dataset_build import collect_videos, extract_frames
+            buf = io.StringIO()
+            old_stdout = sys.stdout
+            sys.stdout = buf
+            try:
+                all_videos = collect_videos(videos)
+                for v in all_videos:
+                    extract_frames(v, output, interval,
+                        min_laplacian=lap, min_entropy=ent,
+                        min_brightness=min_b, max_brightness=max_b)
+            finally:
+                sys.stdout = old_stdout
+            return buf.getvalue() or "抽帧完成"
 
-            btn_filter = QPushButton("扫描质量")
-            btn_filter.clicked.connect(self._run_filter)
-            fl2.addRow(btn_filter)
-            layout.addWidget(grp_filter)
+        # ============================================================
+        # ③ 数据集划分 Tab
+        # ============================================================
+        def _build_split_tab(self) -> QWidget:
+            w = QWidget()
+            layout = QVBoxLayout(w)
 
-            # -- 数据集划分 --
-            grp_split = QGroupBox("数据集划分 (split_dataset)")
-            fl3 = QFormLayout(grp_split)
+            grp_split = QGroupBox("训练/验证集划分")
+            fl = QFormLayout(grp_split)
             self._split_dir = QLineEdit("dataset")
-            fl3.addRow("数据集目录:", self._split_dir)
+            fl.addRow("数据集目录:", self._split_dir)
 
             self._split_ratio = QDoubleSpinBox()
             self._split_ratio.setRange(0.01, 0.99)
             self._split_ratio.setValue(0.2)
             self._split_ratio.setSingleStep(0.05)
-            fl3.addRow("验证集比例:", self._split_ratio)
+            fl.addRow("验证集比例:", self._split_ratio)
 
             btn_split = QPushButton("执行划分")
+            btn_split.setStyleSheet("font-size: 14px; padding: 8px;")
             btn_split.clicked.connect(self._run_split)
-            fl3.addRow(btn_split)
+            fl.addRow(btn_split)
             layout.addWidget(grp_split)
-
             layout.addStretch()
             return w
-
-        def _run_build(self):
-            video = self._build_video.text().strip()
-            output = self._build_output.text().strip()
-            interval = self._build_interval.value()
-            if not video:
-                QMessageBox.warning(self, "提示", "请选择视频文件")
-                return
-            self._run_worker(
-                lambda: self._do_build(video, output, interval),
-                lambda msg: QMessageBox.information(self, "完成", str(msg)),
-                "抽帧中",
-            )
-
-        def _do_build(self, video, output, interval):
-            import io
-            from dataset_build import extract_frames
-            buf = io.StringIO()
-            old_stdout = sys.stdout
-            sys.stdout = buf
-            try:
-                extract_frames(video, output, interval)
-            finally:
-                sys.stdout = old_stdout
-            return buf.getvalue() or "抽帧完成"
-
-        def _run_filter(self):
-            path = self._filter_dir.text().strip()
-            threshold = self._filter_laplacian.value()
-            if not path:
-                QMessageBox.warning(self, "提示", "请选择图片目录")
-                return
-            self._run_worker(
-                lambda: self._do_filter(path, threshold),
-                lambda msg: QMessageBox.information(self, "过滤结果", str(msg)),
-                "扫描中",
-            )
-
-        def _do_filter(self, path, threshold):
-            import io
-            from filter_quality import assess_image, collect_images
-            buf = io.StringIO()
-            old_stdout = sys.stdout
-            sys.stdout = buf
-            try:
-                exts = (".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff")
-                images = collect_images([path], exts)
-                rejected = []
-                ok_count = 0
-                for img in images:
-                    m = assess_image(img)
-                    if "error" in m:
-                        rejected.append(img)
-                    elif m["laplacian_var"] < threshold:
-                        rejected.append(img)
-                    else:
-                        ok_count += 1
-                print(f"总计: {len(images)}  合格: {ok_count}  不合格: {len(rejected)}")
-                print(f"阈值: laplacian_var >= {threshold}")
-            finally:
-                sys.stdout = old_stdout
-            return buf.getvalue()
 
         def _run_split(self):
             path = self._split_dir.text().strip()
@@ -703,6 +681,11 @@ def gui_main():
             path, _ = QFileDialog.getOpenFileName(self, "选择文件", "", filter_str)
             if path:
                 target.setText(path)
+
+        def _browse_files(self, target: QLineEdit, filter_str: str):
+            paths, _ = QFileDialog.getOpenFileNames(self, "选择文件", "", filter_str)
+            if paths:
+                target.setText("; ".join(paths))
 
         def _browse_dir(self, target: QLineEdit):
             path = QFileDialog.getExistingDirectory(self, "选择目录")
