@@ -166,23 +166,25 @@ def gui_main():
     from label_studio_project import list_projects, get_project, create_project, delete_project
     from label_studio_data import list_tasks, delete_tasks_batch, task_stats
 
-    # ---- Worker ----
-    class Worker(QThread):
+    # ---- StreamWorker ----
+    class StreamWorker(QThread):
+        log_line = Signal(str)
         finished = Signal(object)
         error = Signal(str)
 
-        def __init__(self, fn, *args, **kwargs):
+        def __init__(self, fn):
             super().__init__()
             self.fn = fn
-            self.args = args
-            self.kwargs = kwargs
 
         def run(self):
             try:
-                result = self.fn(*self.args, **self.kwargs)
+                result = self.fn(log=self._log)
                 self.finished.emit(result)
             except Exception as e:
                 self.error.emit(str(e))
+
+        def _log(self, msg: str):
+            self.log_line.emit(msg)
 
 
     # ---- 主窗口 ----
@@ -190,14 +192,14 @@ def gui_main():
         def __init__(self):
             super().__init__()
             self.setWindowTitle("CTTS — CNN Train Tools Set")
-            self.resize(960, 640)
+            self.resize(960, 700)
             self.client = None
             self._workers = []
 
             try:
                 self.client = get_client()
             except Exception:
-                pass  # Label Studio 可能没启动
+                pass
 
             self._build_ui()
 
@@ -213,6 +215,20 @@ def gui_main():
             tabs.addTab(self._build_train_tab(), "④ 训练")
             tabs.addTab(self._build_detect_tab(), "⑤ 推理")
             layout.addWidget(tabs)
+
+            # 共享进度条
+            self._progress = QProgressBar()
+            self._progress.setRange(0, 0)  # indeterminate
+            self._progress.setVisible(False)
+            self._progress.setMaximumHeight(18)
+            layout.addWidget(self._progress)
+
+            # 共享日志输出
+            self._log_output = QTextEdit()
+            self._log_output.setReadOnly(True)
+            self._log_output.setMaximumHeight(150)
+            self._log_output.setPlaceholderText("操作日志将显示在这里...")
+            layout.addWidget(self._log_output)
 
         # ============================================================
         # ① 数据准备 Tab
@@ -282,27 +298,30 @@ def gui_main():
                 QMessageBox.warning(self, "提示", "请选择视频文件")
                 return
             videos = [v.strip() for v in video_text.split(";") if v.strip()]
-            self._run_worker(
-                lambda: self._do_build(videos, output, interval, lap, ent, min_b, max_b),
-                lambda msg: QMessageBox.information(self, "完成", str(msg)),
+            self._start_task(
+                lambda log: self._do_build(log, videos, output, interval, lap, ent, min_b, max_b),
                 "抽帧中",
             )
 
-        def _do_build(self, videos, output, interval, lap, ent, min_b, max_b):
-            import io
+        def _do_build(self, log, videos, output, interval, lap, ent, min_b, max_b):
             from dataset_build import collect_videos, extract_frames
-            buf = io.StringIO()
-            old_stdout = sys.stdout
-            sys.stdout = buf
-            try:
-                all_videos = collect_videos(videos)
-                for v in all_videos:
+            all_videos = collect_videos(videos)
+            log(f"找到 {len(all_videos)} 个视频\n")
+            for i, v in enumerate(all_videos):
+                log(f"[{i+1}/{len(all_videos)}] {v}")
+                # 重定向 stdout 以实现流式输出
+                import io
+                buf = io.StringIO()
+                old = sys.stdout
+                sys.stdout = buf
+                try:
                     extract_frames(v, output, interval,
                         min_laplacian=lap, min_entropy=ent,
                         min_brightness=min_b, max_brightness=max_b)
-            finally:
-                sys.stdout = old_stdout
-            return buf.getvalue() or "抽帧完成"
+                finally:
+                    sys.stdout = old
+                log(buf.getvalue())
+            log("\n✅ 抽帧完成")
 
         # ============================================================
         # ③ 数据集划分 Tab
@@ -333,24 +352,23 @@ def gui_main():
         def _run_split(self):
             path = self._split_dir.text().strip()
             ratio = self._split_ratio.value()
-            self._run_worker(
-                lambda: self._do_split(path, ratio),
-                lambda msg: QMessageBox.information(self, "划分完成", str(msg)),
-                "划分中",
+            self._start_task(
+                lambda log: self._do_split(log, path, ratio),
+                "数据集划分",
             )
 
-        def _do_split(self, path, ratio):
+        def _do_split(self, log, path, ratio):
             import io
             from split_dataset import split_dataset
             from pathlib import Path
             buf = io.StringIO()
-            old_stdout = sys.stdout
+            old = sys.stdout
             sys.stdout = buf
             try:
                 split_dataset(Path(path), val_ratio=ratio, seed=42)
             finally:
-                sys.stdout = old_stdout
-            return buf.getvalue() or "数据集划分完成"
+                sys.stdout = old
+            log(buf.getvalue() or "✅ 划分完成")
 
         # ============================================================
         # 标注管理 Tab
@@ -425,7 +443,7 @@ def gui_main():
             return w
 
         def _ls_refresh_projects(self):
-            self._run_worker(
+            self._run_task(
                 lambda: list_projects(self.client),
                 lambda ps: self._ls_populate_projects(ps),
                 "加载项目",
@@ -442,7 +460,7 @@ def gui_main():
             from PySide6.QtWidgets import QInputDialog
             title, ok = QInputDialog.getText(self, "新建项目", "项目名称:")
             if ok and title:
-                self._run_worker(
+                self._run_task(
                     lambda: create_project(title, template="detection", client=self.client),
                     lambda p: (QMessageBox.information(self, "完成", f"项目已创建 ID={p['id']}"),
                                self._ls_refresh_projects()),
@@ -456,7 +474,7 @@ def gui_main():
             pid = int(self._ls_project_table.item(rows[0].row(), 0).text())
             ans = QMessageBox.question(self, "确认", f"删除项目 {pid}？", QMessageBox.Yes | QMessageBox.No)
             if ans == QMessageBox.Yes:
-                self._run_worker(
+                self._run_task(
                     lambda: delete_project(pid, self.client),
                     lambda _: (QMessageBox.information(self, "完成", f"已删除"), self._ls_refresh_projects()),
                     "删除项目",
@@ -464,7 +482,7 @@ def gui_main():
 
         def _ls_load_tasks(self):
             pid = self._ls_task_project.value()
-            self._run_worker(
+            self._run_task(
                 lambda: list_tasks(pid, page=1, page_size=100, client=self.client),
                 self._ls_populate_tasks,
                 "加载任务",
@@ -481,7 +499,7 @@ def gui_main():
 
         def _ls_show_stats(self):
             pid = self._ls_task_project.value()
-            self._run_worker(
+            self._run_task(
                 lambda: task_stats(pid, self.client),
                 lambda s: QMessageBox.information(self, f"项目 {pid} 统计",
                     f"总任务: {s['total']}\n已标注: {s['labeled']} ({s['labeled']/max(s['total'],1)*100:.1f}%)\n未标注: {s['unlabeled']}"),
@@ -496,7 +514,7 @@ def gui_main():
             ans = QMessageBox.question(self, "确认", f"删除 {len(ids)} 个任务？", QMessageBox.Yes | QMessageBox.No)
             if ans == QMessageBox.Yes:
                 pid = self._ls_task_project.value()
-                self._run_worker(
+                self._run_task(
                     lambda: delete_tasks_batch(pid, ids, self.client),
                     lambda _: (QMessageBox.information(self, "完成", f"已删除 {len(ids)} 个"), self._ls_load_tasks()),
                     "删除任务",
@@ -543,11 +561,6 @@ def gui_main():
             btn_train.clicked.connect(self._run_train)
             fl.addRow(btn_train)
 
-            self._train_output = QTextEdit()
-            self._train_output.setReadOnly(True)
-            self._train_output.setPlaceholderText("训练日志将显示在这里...")
-            fl.addRow(self._train_output)
-
             layout.addWidget(grp)
             return w
 
@@ -563,32 +576,27 @@ def gui_main():
                 QMessageBox.warning(self, "提示", f"权重文件不存在: {weights}")
                 return
 
-            self._train_output.clear()
-            self._train_output.append("🚀 启动训练...\n")
-
-            def train_fn():
-                import io
-                from ultralytics import YOLO
-                model = YOLO(weights)
-                buf = io.StringIO()
-                old_stdout = sys.stdout
-                sys.stdout = buf
-                try:
-                    model.train(
-                        data=data, epochs=epochs, imgsz=imgsz,
-                        batch=batch, device=device, amp=True,
-                    )
-                except Exception as e:
-                    print(f"训练出错: {e}")
-                finally:
-                    sys.stdout = old_stdout
-                return buf.getvalue()
-
-            self._run_worker(
-                train_fn,
-                lambda log: self._train_output.append(log or "训练完成"),
+            self._start_task(
+                lambda log: self._do_train(log, weights, data, epochs, batch, imgsz, device),
                 "YOLO 训练",
             )
+
+        def _do_train(self, log, weights, data, epochs, batch, imgsz, device):
+            import io
+            from ultralytics import YOLO
+            log(f"🚀 启动训练: {weights}\n")
+            model = YOLO(weights)
+            buf = io.StringIO()
+            old = sys.stdout
+            sys.stdout = buf
+            try:
+                model.train(data=data, epochs=epochs, imgsz=imgsz,
+                            batch=batch, device=device, amp=True)
+            except Exception as e:
+                log(f"训练出错: {e}")
+            finally:
+                sys.stdout = old
+            log(buf.getvalue() or "\n✅ 训练完成")
 
         # ============================================================
         # 推理 Tab
@@ -668,12 +676,36 @@ def gui_main():
         # ============================================================
         # 通用方法
         # ============================================================
-        def _run_worker(self, fn, callback, desc="处理中"):
-            worker = Worker(fn)
+        def _show_progress(self, show: bool):
+            self._progress.setVisible(show)
+            if show:
+                self._progress.setRange(0, 0)  # indeterminate
+
+        def _log_append(self, msg: str):
+            self._log_output.append(msg.rstrip())
+            # 自动滚动到底部
+            sb = self._log_output.verticalScrollBar()
+            sb.setValue(sb.maximum())
+
+        def _clear_log(self):
+            self._log_output.clear()
+
+        def _run_task(self, fn, callback, desc="处理中"):
+            """启动后台任务（无日志流，仅进度条 + 结果回调）。"""
+            self._show_progress(True)
+            # 包装为兼容 StreamWorker 的 fn_with_log 形式
+            def wrapper(log):
+                return fn()
+            worker = StreamWorker(wrapper)
             worker.finished.connect(callback)
-            worker.finished.connect(lambda _: (worker.deleteLater(), self._workers.remove(worker)))
-            worker.error.connect(lambda e: QMessageBox.critical(self, "错误", str(e)))
-            worker.error.connect(lambda _: (worker.deleteLater(), self._workers.remove(worker)))
+            worker.finished.connect(lambda _: self._show_progress(False))
+            worker.finished.connect(lambda _: (worker.deleteLater(),
+                self._workers.remove(worker) if worker in self._workers else None))
+            worker.error.connect(lambda e: (
+                self._log_append(f"❌ {desc}错误: {e}"), self._show_progress(False),
+                QMessageBox.critical(self, "错误", str(e))))
+            worker.error.connect(lambda _: (worker.deleteLater(),
+                self._workers.remove(worker) if worker in self._workers else None))
             self._workers.append(worker)
             worker.start()
 
