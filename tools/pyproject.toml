@@ -1,0 +1,15 @@
+[project]
+name = "ctts"
+version = "0.1.0"
+description = "CNN Train Tools Set — 视觉 CNN 训练全流程工具集"
+requires-python = ">=3.13"
+dependencies = [
+    "opencv-python>=4.8",
+    "numpy>=1.24",
+    "requests>=2.28",
+    "pyside6>=6.5",
+    "ultralytics>=8.0",
+]
+
+# eDisk 文件系统不支持 symlink，venv 需放在其他位置
+# 首次使用: uv venv ~/.cache/ctts-venv && source ~/.cache/ctts-venv/bin/activate && uv sync --active

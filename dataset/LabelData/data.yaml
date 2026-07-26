@@ -1,0 +1,7 @@
+# 由 split_dataset.py 自动生成
+path: /home/ryanz/eDisk/nuedc/26/vision/dataset/LabelData
+train: train/images
+val: val/images
+nc: 1
+names:
+  0: "stb"

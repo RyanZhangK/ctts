@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+*.egg-info/
+dist/
+
+# 模型权重（太大，需单独下载）
+weights/*.pt
+weights/*.pth
+weights/*.onnx
+weights/*.engine
+
+# 数据集（太大，不纳入版本控制）
+# 仅保留 data.yaml classes.txt notes.json 等配置文件
+dataset/*/train/
+dataset/*/val/
+dataset/RawData/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# uv
+uv.lock
+
+# Label Studio
+*.sqlite3
