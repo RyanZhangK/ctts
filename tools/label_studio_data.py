@@ -10,6 +10,7 @@
 
 import argparse
 import json
+import os
 import sys
 
 from label_studio_auth import get_client
@@ -53,6 +54,70 @@ def delete_tasks_batch(project_id: int, task_ids: list[int], client=None) -> dic
         "project": project_id,
         "selected_items": {"all": False, "included": task_ids},
     })
+
+
+# ---------------------------------------------------------------------------
+# 批量导入
+# ---------------------------------------------------------------------------
+
+def import_tasks_from_images(
+    project_id: int,
+    image_paths: list[str],
+    client=None,
+) -> dict:
+    """批量导入本地图片作为标注任务。
+
+    通过 Label Studio 的文件上传 API 将每张图片创建为一个任务。
+    每次请求只发送一张图片，避免单次请求过大导致超时或服务端错误。
+
+    Args:
+        project_id: 目标项目 ID
+        image_paths: 本地图片文件路径列表
+        client: Label Studio 客户端（可选）
+
+    Returns:
+        API 响应 dict，包含 task_count 和 errors 列表
+    """
+    import mimetypes
+
+    c = client or get_client()
+    url = f"{c.base_url}/api/projects/{project_id}/import"
+
+    # 文件上传需要 multipart/form-data，必须临时移除 session 中硬编码的
+    # application/json，否则 Label Studio 会尝试把二进制图片当 JSON 解析
+    ct_header = c.session.headers.pop("Content-Type", None)
+
+    total = len(image_paths)
+    errors = []
+
+    try:
+        for i, p in enumerate(image_paths, 1):
+            mime_type = mimetypes.guess_type(p)[0] or "image/png"
+            filename = os.path.basename(p)
+            try:
+                with open(p, "rb") as fh:
+                    r = c.session.post(
+                        url,
+                        files={"file": (filename, fh, mime_type)},
+                    )
+                if not r.ok:
+                    try:
+                        detail = r.json()
+                    except Exception:
+                        detail = r.text[:500]
+                    errors.append(f"[{i}/{total}] {filename}: HTTP {r.status_code} — {detail}")
+                    continue
+            except Exception as e:
+                errors.append(f"[{i}/{total}] {filename}: {e}")
+                continue
+    finally:
+        if ct_header:
+            c.session.headers["Content-Type"] = ct_header
+
+    result = {"task_count": total - len(errors)}
+    if errors:
+        result["errors"] = errors
+    return result
 
 
 # ---------------------------------------------------------------------------

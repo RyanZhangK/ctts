@@ -164,7 +164,7 @@ def gui_main():
 
     from label_studio_auth import get_client
     from label_studio_project import list_projects, get_project, create_project, delete_project
-    from label_studio_data import list_tasks, delete_tasks_batch, task_stats
+    from label_studio_data import list_tasks, delete_tasks_batch, task_stats, import_tasks_from_images
 
     # ---- StreamWorker ----
     class StreamWorker(QThread):
@@ -208,6 +208,14 @@ def gui_main():
             self.setCentralWidget(central)
             layout = QVBoxLayout(central)
 
+            # 共享进度条（必须在 Tab 构建之前创建，因为 _build_label_tab
+            # 会立即触发 _run_task → _show_progress，需要 self._progress 已存在）
+            self._progress = QProgressBar()
+            self._progress.setRange(0, 0)  # indeterminate
+            self._progress.setVisible(False)
+            self._progress.setMaximumHeight(18)
+            layout.addWidget(self._progress)
+
             tabs = QTabWidget()
             tabs.addTab(self._build_data_tab(), "① 数据准备")
             tabs.addTab(self._build_label_tab(), "② 标注管理")
@@ -215,13 +223,6 @@ def gui_main():
             tabs.addTab(self._build_train_tab(), "④ 训练")
             tabs.addTab(self._build_detect_tab(), "⑤ 推理")
             layout.addWidget(tabs)
-
-            # 共享进度条
-            self._progress = QProgressBar()
-            self._progress.setRange(0, 0)  # indeterminate
-            self._progress.setVisible(False)
-            self._progress.setMaximumHeight(18)
-            layout.addWidget(self._progress)
 
             # 共享日志输出
             self._log_output = QTextEdit()
@@ -345,6 +346,10 @@ def gui_main():
             btn_split.setStyleSheet("font-size: 14px; padding: 8px;")
             btn_split.clicked.connect(self._run_split)
             fl.addRow(btn_split)
+
+            btn_dry = QPushButton("预览划分 (Dry Run)")
+            btn_dry.clicked.connect(self._run_split_dry)
+            fl.addRow(btn_dry)
             layout.addWidget(grp_split)
             layout.addStretch()
             return w
@@ -369,6 +374,28 @@ def gui_main():
             finally:
                 sys.stdout = old
             log(buf.getvalue() or "✅ 划分完成")
+
+        def _run_split_dry(self):
+            """预览数据集划分结果（不实际复制文件）。"""
+            path = self._split_dir.text().strip()
+            ratio = self._split_ratio.value()
+            self._start_task(
+                lambda log: self._do_split_dry(log, path, ratio),
+                "划分预览",
+            )
+
+        def _do_split_dry(self, log, path, ratio):
+            import io
+            from split_dataset import split_dataset
+            from pathlib import Path
+            buf = io.StringIO()
+            old = sys.stdout
+            sys.stdout = buf
+            try:
+                split_dataset(Path(path), val_ratio=ratio, seed=42, dry_run=True)
+            finally:
+                sys.stdout = old
+            log(buf.getvalue() or "✅ 预览完成")
 
         # ============================================================
         # 标注管理 Tab
@@ -404,6 +431,7 @@ def gui_main():
             self._ls_project_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
             self._ls_project_table.setSelectionBehavior(QTableWidget.SelectRows)
             self._ls_project_table.setEditTriggers(QTableWidget.NoEditTriggers)
+            self._ls_project_table.itemSelectionChanged.connect(self._ls_on_project_selected)
             pl.addWidget(self._ls_project_table)
             layout.addWidget(grp_proj)
 
@@ -438,6 +466,32 @@ def gui_main():
             tl.addWidget(self._ls_task_table)
             layout.addWidget(grp_task)
 
+            # 批量上传图片
+            grp_upload = QGroupBox("批量上传图片")
+            ul = QVBoxLayout(grp_upload)
+            up_row = QHBoxLayout()
+            up_row.addWidget(QLabel("目标项目 ID:"))
+            self._ls_upload_project = QSpinBox()
+            self._ls_upload_project.setRange(1, 9999)
+            self._ls_upload_project.setValue(10)
+            up_row.addWidget(self._ls_upload_project)
+            btn_select = QPushButton("选择图片...")
+            btn_select.clicked.connect(self._ls_select_images)
+            up_row.addWidget(btn_select)
+            btn_folder = QPushButton("选择文件夹...")
+            btn_folder.clicked.connect(self._ls_select_folder)
+            up_row.addWidget(btn_folder)
+            btn_upload = QPushButton("上传")
+            btn_upload.setStyleSheet("font-weight: bold;")
+            btn_upload.clicked.connect(self._ls_upload_images)
+            up_row.addWidget(btn_upload)
+            up_row.addStretch()
+            ul.addLayout(up_row)
+            self._ls_upload_info = QLabel("未选择文件")
+            self._ls_upload_info.setStyleSheet("color: gray;")
+            ul.addWidget(self._ls_upload_info)
+            layout.addWidget(grp_upload)
+
             # 首次加载
             self._ls_refresh_projects()
             return w
@@ -455,6 +509,15 @@ def gui_main():
                 self._ls_project_table.setItem(i, 0, QTableWidgetItem(str(p["id"])))
                 self._ls_project_table.setItem(i, 1, QTableWidgetItem(p.get("title", "")))
                 self._ls_project_table.setItem(i, 2, QTableWidgetItem(str(p.get("task_number", 0))))
+
+        def _ls_on_project_selected(self):
+            """项目列表选中行时，自动同步项目 ID 到任务管理和上传区域。"""
+            rows = self._ls_project_table.selectionModel().selectedRows()
+            if not rows:
+                return
+            pid = int(self._ls_project_table.item(rows[0].row(), 0).text())
+            self._ls_task_project.setValue(pid)
+            self._ls_upload_project.setValue(pid)
 
         def _ls_create_project(self):
             from PySide6.QtWidgets import QInputDialog
@@ -519,6 +582,86 @@ def gui_main():
                     lambda _: (QMessageBox.information(self, "完成", f"已删除 {len(ids)} 个"), self._ls_load_tasks()),
                     "删除任务",
                 )
+
+        _IMG_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp", ".tiff", ".tif"}
+
+        @classmethod
+        def _scan_images(cls, root: str) -> list[str]:
+            """递归扫描目录下所有图片文件。"""
+            result = []
+            try:
+                for entry in os.scandir(root):
+                    if entry.is_file() and os.path.splitext(entry.name)[1].lower() in cls._IMG_EXTS:
+                        result.append(entry.path)
+                    elif entry.is_dir():
+                        result.extend(cls._scan_images(entry.path))
+            except PermissionError:
+                pass
+            return sorted(result)
+
+        def _ls_select_images(self):
+            """选择要上传的图片文件。"""
+            paths, _ = QFileDialog.getOpenFileNames(
+                self, "选择图片", "",
+                "图片文件 (*.png *.jpg *.jpeg *.bmp *.gif *.webp);;所有文件 (*)",
+            )
+            if paths:
+                self._ls_image_paths = paths
+                self._ls_upload_info.setText(f"已选择 {len(paths)} 张图片")
+                self._ls_upload_info.setStyleSheet("color: green;")
+
+        def _ls_select_folder(self):
+            """选择文件夹，递归扫描其中所有图片。"""
+            folder = QFileDialog.getExistingDirectory(self, "选择图片所在文件夹")
+            if folder:
+                paths = self._scan_images(folder)
+                self._ls_image_paths = paths
+                if paths:
+                    self._ls_upload_info.setText(f"已选择 {len(paths)} 张图片（来自 {folder}）")
+                    self._ls_upload_info.setStyleSheet("color: green;")
+                else:
+                    self._ls_upload_info.setText(f"文件夹内无图片: {folder}")
+                    self._ls_upload_info.setStyleSheet("color: orange;")
+
+        def _ls_upload_images(self):
+            """批量上传图片到 Label Studio 项目。"""
+            if not getattr(self, "_ls_image_paths", None):
+                QMessageBox.warning(self, "提示", "请先选择要上传的图片文件。")
+                return
+
+            pid = self._ls_upload_project.value()
+            paths = self._ls_image_paths
+
+            ans = QMessageBox.question(
+                self, "确认上传",
+                f"将 {len(paths)} 张图片上传到项目 {pid}？\n\n这会为每张图片创建一个标注任务。",
+                QMessageBox.Yes | QMessageBox.No,
+            )
+            if ans != QMessageBox.Yes:
+                return
+
+            def do_upload():
+                return import_tasks_from_images(pid, paths, client=self.client)
+
+            def on_done(result):
+                n = result.get("task_count", 0)
+                errs = result.get("errors", [])
+                if errs:
+                    detail = "\n".join(errs[:10])
+                    more = f"\n... 还有 {len(errs) - 10} 个错误" if len(errs) > 10 else ""
+                    QMessageBox.warning(self, "上传完成（有错误）",
+                        f"成功 {n} 个，失败 {len(errs)} 个\n\n失败详情:\n{detail}{more}")
+                else:
+                    QMessageBox.information(self, "上传完成",
+                        f"已导入 {n} 个任务到项目 {pid}")
+                self._ls_image_paths = []
+                self._ls_upload_info.setText("未选择文件")
+                self._ls_upload_info.setStyleSheet("color: gray;")
+                # 刷新任务列表
+                if self._ls_task_project.value() == pid:
+                    self._ls_load_tasks()
+
+            self._run_task(do_upload, on_done, "上传图片")
 
         # ============================================================
         # 训练 Tab
@@ -689,6 +832,27 @@ def gui_main():
 
         def _clear_log(self):
             self._log_output.clear()
+
+        def _start_task(self, fn, desc="处理中"):
+            """启动带日志流的后台任务。
+
+            fn 签名为 fn(log: callable) -> Any，log(msg) 会将消息推送到日志面板。
+            """
+            self._clear_log()
+            self._show_progress(True)
+            worker = StreamWorker(fn)
+            worker.log_line.connect(lambda msg: self._log_append(msg))
+            worker.finished.connect(lambda _: (
+                self._log_append(f"✅ {desc}完成"), self._show_progress(False)))
+            worker.finished.connect(lambda _: (worker.deleteLater(),
+                self._workers.remove(worker) if worker in self._workers else None))
+            worker.error.connect(lambda e: (
+                self._log_append(f"❌ {desc}错误: {e}"), self._show_progress(False),
+                QMessageBox.critical(self, "错误", str(e))))
+            worker.error.connect(lambda _: (worker.deleteLater(),
+                self._workers.remove(worker) if worker in self._workers else None))
+            self._workers.append(worker)
+            worker.start()
 
         def _run_task(self, fn, callback, desc="处理中"):
             """启动后台任务（无日志流，仅进度条 + 结果回调）。"""

@@ -112,6 +112,7 @@ def add_local_storage(
     path: str,
     regex_filter: str = r".*\.(jpg|jpeg|png|bmp)$",
     title: str = "本地图片",
+    recursive_scan: bool = False,
     client=None,
 ) -> dict:
     """为项目配置本地文件存储。
@@ -121,6 +122,7 @@ def add_local_storage(
         path: 图片目录的绝对路径（需在 LOCAL_FILES_DOCUMENT_ROOT 下）
         regex_filter: 文件名过滤正则
         title: 存储标题
+        recursive_scan: 是否递归扫描子目录
     """
     c = client or get_client()
     return c.post("/api/storages/localfiles/", data={
@@ -129,6 +131,7 @@ def add_local_storage(
         "regex_filter": regex_filter,
         "use_blob_urls": True,
         "title": title,
+        "recursive_scan": recursive_scan,
     })
 
 

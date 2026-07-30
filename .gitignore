@@ -11,6 +11,7 @@ weights/*.pt
 weights/*.pth
 weights/*.onnx
 weights/*.engine
+runs/
 
 # 数据集图片与标签（太大，不纳入版本控制）
 dataset/*/images/
@@ -18,6 +19,7 @@ dataset/*/labels/
 dataset/*/train/
 dataset/*/val/
 dataset/RawData/
+dataset/LabelData/
 
 # IDE
 .vscode/
