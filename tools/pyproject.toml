@@ -13,4 +13,4 @@ dependencies = [
 ]
 
 # eDisk 文件系统不支持 symlink，venv 需放在其他位置
-# 首次使用: uv venv ~/.cache/ctts-venv && source ~/.cache/ctts-venv/bin/activate && uv sync --active
+# 首次使用: python setup_env.py（跨平台，自动创建 venv 并安装依赖）

@@ -35,13 +35,29 @@ ctts/
 
 ### 环境配置
 
+跨平台一键初始化（Linux / macOS / Windows）：
+
 ```bash
 cd ctts/tools/
 
-# 安装依赖（需 uv）
-uv venv ~/.cache/ctts-venv
-source ~/.cache/ctts-venv/bin/activate
-uv sync --active --link-mode=copy
+python setup_env.py          # 创建 venv 并安装依赖（优先 uv，否则回退到 pip）
+python setup_env.py --run    # 初始化后直接启动 GUI
+python setup_env.py --check  # 只检查环境
+```
+
+也可使用平台入口：
+
+```bash
+./setup_env.sh      # Linux / macOS
+setup_env.cmd       # Windows（双击或命令行）
+```
+
+venv 默认位于 `~/.cache/ctts-venv`（可通过 `--venv` 或 `CTTS_VENV` 修改）。
+初始化后手动激活：
+
+```bash
+source ~/.cache/ctts-venv/bin/activate    # Linux / macOS
+# 或 PowerShell: & "$HOME\.cache\ctts-venv\Scripts\Activate.ps1"
 ```
 
 ### CLI 使用

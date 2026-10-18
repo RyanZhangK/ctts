@@ -159,16 +159,23 @@ def gui_main():
             QCheckBox, QDoubleSpinBox, QSlider,
         )
     except ModuleNotFoundError:
-        venv_py = os.path.join(
-            os.path.expanduser("~"), ".cache", "ctts-venv", "Scripts", "python.exe",
-        )
+        venv_dir = os.path.expanduser(os.environ.get("CTTS_VENV", "~/.cache/ctts-venv"))
+        if os.name == "nt":
+            venv_py = os.path.join(venv_dir, "Scripts", "python.exe")
+            activate = os.path.join(venv_dir, "Scripts", "Activate.ps1")
+        else:
+            venv_py = os.path.join(venv_dir, "bin", "python")
+            activate = os.path.join(venv_dir, "bin", "activate")
+        setup_py = os.path.join(os.path.dirname(os.path.abspath(__file__)), "setup_env.py")
         print("❌ 当前解释器没有 PySide6。")
         print(f"   当前: {sys.executable}")
-        print("请用项目 venv 启动：")
-        print(f'   & "{venv_py}" "{os.path.abspath(__file__)}" --gui')
+        print("首次使用请先初始化环境：")
+        print(f'   "{sys.executable}" "{setup_py}"')
+        print("初始化完成后启动 GUI：")
+        print(f'   "{venv_py}" "{os.path.abspath(__file__)}" --gui')
         if os.path.isfile(venv_py):
             print("或先激活：")
-            print(f'   & "{os.path.join(os.path.dirname(venv_py), "Activate.ps1")}"')
+            print(f'   {activate}')
             print("   python ctts.py --gui")
         sys.exit(1)
 
@@ -998,7 +1005,13 @@ def gui_main():
     # ---- 启动 ----
     try:
         app = QApplication(sys.argv)
-        app.setFont(QFont("Microsoft YaHei UI", 10))
+        if sys.platform.startswith("win"):
+            gui_font = "Microsoft YaHei UI"
+        elif sys.platform == "darwin":
+            gui_font = "PingFang SC"
+        else:
+            gui_font = "Noto Sans CJK SC"
+        app.setFont(QFont(gui_font, 10))
         win = CTTSWindow()
         win.show()
         app.exec()

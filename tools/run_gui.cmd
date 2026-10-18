@@ -1,9 +1,6 @@
 @echo off
-set "VENV_PY=%USERPROFILE%\.cache\ctts-venv\Scripts\python.exe"
-if not exist "%VENV_PY%" (
-  echo venv not found: %VENV_PY%
-  echo Run setup_venv.cmd first.
-  exit /b 1
-)
-"%VENV_PY%" "%~dp0ctts.py" --gui
+rem 环境缺失时自动创建并安装依赖，然后启动 GUI。
+set "PY=python"
+where py >nul 2>nul && set "PY=py -3"
+%PY% "%~dp0setup_env.py" --run %*
 exit /b %ERRORLEVEL%
