@@ -9,12 +9,13 @@ CLI 示例:
   python ctts.py data split dataset/ -v 0.2
   python ctts.py label project list
   python ctts.py label data stats -p 10
+  # 远程 Label Studio（参数跟在子模块后）
+  python ctts.py label project -- --base-url http://192.168.1.10:8080 --token <TOKEN> list
   python ctts.py train
   python ctts.py detect --cam 0
 
 GUI 模式:
   python ctts.py --gui
-  (需要 PySide6，建议: conda activate ML && python ctts.py --gui)
 """
 
 import argparse
@@ -158,13 +159,45 @@ def gui_main():
             QCheckBox, QDoubleSpinBox, QSlider,
         )
     except ModuleNotFoundError:
-        print("❌ PySide6 未安装。请使用 conda ML 环境：")
-        print("   conda activate ML && python ctts.py --gui")
+        venv_py = os.path.join(
+            os.path.expanduser("~"), ".cache", "ctts-venv", "Scripts", "python.exe",
+        )
+        print("❌ 当前解释器没有 PySide6。")
+        print(f"   当前: {sys.executable}")
+        print("请用项目 venv 启动：")
+        print(f'   & "{venv_py}" "{os.path.abspath(__file__)}" --gui')
+        if os.path.isfile(venv_py):
+            print("或先激活：")
+            print(f'   & "{os.path.join(os.path.dirname(venv_py), "Activate.ps1")}"')
+            print("   python ctts.py --gui")
         sys.exit(1)
 
-    from label_studio_auth import get_client
-    from label_studio_project import list_projects, get_project, create_project, delete_project
-    from label_studio_data import list_tasks, delete_tasks_batch, task_stats, import_tasks_from_images
+    try:
+        from label_studio_auth import (
+            DEFAULT_BASE_URL,
+            get_client,
+            reset_clients,
+            resolve_base_url,
+        )
+        from label_studio_project import list_projects, create_project, delete_project
+        from label_studio_data import list_tasks, delete_tasks_batch, task_stats, import_tasks_from_images
+        _ls_import_error = None
+    except Exception as e:
+        _ls_import_error = e
+        DEFAULT_BASE_URL = "http://127.0.0.1:8080"
+
+        def resolve_base_url(base_url=None):
+            return base_url or DEFAULT_BASE_URL
+
+        def get_client(*args, **kwargs):
+            raise RuntimeError(f"Label Studio 模块不可用: {_ls_import_error}")
+
+        def reset_clients():
+            pass
+
+        list_projects = create_project = delete_project = None
+        list_tasks = delete_tasks_batch = task_stats = import_tasks_from_images = None
+        print(f"⚠ Label Studio 模块加载失败（标注页将不可用）: {e}")
 
     # ---- StreamWorker ----
     class StreamWorker(QThread):
@@ -199,7 +232,7 @@ def gui_main():
             try:
                 self.client = get_client()
             except Exception:
-                pass
+                self.client = None
 
             self._build_ui()
 
@@ -404,9 +437,37 @@ def gui_main():
             w = QWidget()
             layout = QVBoxLayout(w)
 
-            if self.client is None:
-                layout.addWidget(QLabel("⚠️ Label Studio 未连接，仅 CLI 模式可用"))
-                return w
+            # 连接配置（本机 / 远程）
+            grp_conn = QGroupBox("Label Studio 连接")
+            cl = QFormLayout(grp_conn)
+            self._ls_url = QLineEdit(resolve_base_url())
+            self._ls_url.setPlaceholderText(DEFAULT_BASE_URL)
+            cl.addRow("地址:", self._ls_url)
+            self._ls_token = QLineEdit()
+            _echo = getattr(QLineEdit, "Password", None)
+            if _echo is None and hasattr(QLineEdit, "EchoMode"):
+                _echo = QLineEdit.EchoMode.Password
+            if _echo is not None:
+                self._ls_token.setEchoMode(_echo)
+            self._ls_token.setPlaceholderText("远程必填；本机可留空（读本地 DB / 环境变量）")
+            env_tok = os.environ.get("LABEL_STUDIO_TOKEN", "")
+            if env_tok:
+                self._ls_token.setText(env_tok)
+            cl.addRow("Token:", self._ls_token)
+            conn_btn_row = QHBoxLayout()
+            btn_connect = QPushButton("连接 / 重连")
+            btn_connect.clicked.connect(self._ls_reconnect)
+            conn_btn_row.addWidget(btn_connect)
+            self._ls_conn_status = QLabel(
+                f"已连接: {self.client.base_url}" if self.client else "未连接"
+            )
+            self._ls_conn_status.setStyleSheet(
+                "color: green;" if self.client else "color: orange;"
+            )
+            conn_btn_row.addWidget(self._ls_conn_status)
+            conn_btn_row.addStretch()
+            cl.addRow(conn_btn_row)
+            layout.addWidget(grp_conn)
 
             # 项目表格
             grp_proj = QGroupBox("项目列表")
@@ -492,11 +553,38 @@ def gui_main():
             ul.addWidget(self._ls_upload_info)
             layout.addWidget(grp_upload)
 
-            # 首次加载
-            self._ls_refresh_projects()
+            # 已自动连上则刷新；否则等用户点「连接 / 重连」
+            if self.client is not None:
+                self._ls_refresh_projects()
             return w
 
+        def _ls_reconnect(self):
+            """按界面上的地址 / Token 连接本机或远程 Label Studio。"""
+            url = self._ls_url.text().strip() or DEFAULT_BASE_URL
+            token = self._ls_token.text().strip() or None
+            try:
+                reset_clients()
+                self.client = get_client(base_url=url, token=token, force_new=True)
+                # 轻量探测（SDK）
+                self.client.whoami()
+                self._ls_conn_status.setText(f"已连接: {self.client.base_url}")
+                self._ls_conn_status.setStyleSheet("color: green;")
+                self._ls_refresh_projects()
+            except Exception as e:
+                self.client = None
+                self._ls_conn_status.setText(f"连接失败: {e}")
+                self._ls_conn_status.setStyleSheet("color: red;")
+                QMessageBox.warning(self, "连接失败", str(e))
+
+        def _ls_require_client(self) -> bool:
+            if self.client is None:
+                QMessageBox.warning(self, "未连接", "请先填写地址/Token 并点击「连接 / 重连」。")
+                return False
+            return True
+
         def _ls_refresh_projects(self):
+            if not self._ls_require_client():
+                return
             self._run_task(
                 lambda: list_projects(self.client),
                 lambda ps: self._ls_populate_projects(ps),
@@ -520,6 +608,8 @@ def gui_main():
             self._ls_upload_project.setValue(pid)
 
         def _ls_create_project(self):
+            if not self._ls_require_client():
+                return
             from PySide6.QtWidgets import QInputDialog
             title, ok = QInputDialog.getText(self, "新建项目", "项目名称:")
             if ok and title:
@@ -531,6 +621,8 @@ def gui_main():
                 )
 
         def _ls_delete_project(self):
+            if not self._ls_require_client():
+                return
             rows = self._ls_project_table.selectionModel().selectedRows()
             if not rows:
                 return
@@ -544,6 +636,8 @@ def gui_main():
                 )
 
         def _ls_load_tasks(self):
+            if not self._ls_require_client():
+                return
             pid = self._ls_task_project.value()
             self._run_task(
                 lambda: list_tasks(pid, page=1, page_size=100, client=self.client),
@@ -561,6 +655,8 @@ def gui_main():
                 self._ls_task_table.setItem(i, 3, QTableWidgetItem(ds[:80] + "..." if len(ds) > 80 else ds))
 
         def _ls_show_stats(self):
+            if not self._ls_require_client():
+                return
             pid = self._ls_task_project.value()
             self._run_task(
                 lambda: task_stats(pid, self.client),
@@ -570,6 +666,8 @@ def gui_main():
             )
 
         def _ls_delete_tasks(self):
+            if not self._ls_require_client():
+                return
             rows = self._ls_task_table.selectionModel().selectedRows()
             if not rows:
                 return
@@ -625,6 +723,8 @@ def gui_main():
 
         def _ls_upload_images(self):
             """批量上传图片到 Label Studio 项目。"""
+            if not self._ls_require_client():
+                return
             if not getattr(self, "_ls_image_paths", None):
                 QMessageBox.warning(self, "提示", "请先选择要上传的图片文件。")
                 return
@@ -896,11 +996,16 @@ def gui_main():
 
 
     # ---- 启动 ----
-    app = QApplication(sys.argv)
-    app.setFont(QFont("Noto Sans CJK SC", 10))
-    win = CTTSWindow()
-    win.show()
-    app.exec()
+    try:
+        app = QApplication(sys.argv)
+        app.setFont(QFont("Microsoft YaHei UI", 10))
+        win = CTTSWindow()
+        win.show()
+        app.exec()
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
 
 
 # ---------------------------------------------------------------------------

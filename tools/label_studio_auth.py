@@ -1,23 +1,38 @@
 #!/usr/bin/env python3
-"""Label Studio 认证模块 —— 自动获取 Token + HTTP 客户端基类。
+"""Label Studio 认证模块 —— Token 解析 + 官方 SDK 客户端（支持本机 / 远程实例）。
 
-Token 获取优先级：SQLite DB → LABEL_STUDIO_TOKEN 环境变量
+连接配置优先级:
+  base_url: CLI/--base-url → LABEL_STUDIO_URL / LABEL_STUDIO_BASE_URL → http://127.0.0.1:8080
+  token:    CLI/--token → LABEL_STUDIO_TOKEN → (仅本机) 本地 SQLite
+
+远程实例无法读取本机 Label Studio DB，必须提供 Token（CLI 或环境变量）。
+
+所有 API 调用均通过官方 ``label-studio-sdk`` 完成（需安装 ``label-studio-sdk``）。
 
 示例:
-  # 作为模块使用
-  from label_studio_auth import get_client
-  client = get_client()
-  projects = client.get("/api/projects/")
+  # 本机(自动从本地 DB 读 token)
+  python label_studio_auth.py
 
-  # 独立运行，验证 token 状态
+  # 远程
+  python label_studio_auth.py --base-url http://192.168.1.10:8080 --token <TOKEN>
+  # 或
+  set LABEL_STUDIO_URL=http://192.168.1.10:8080
+  set LABEL_STUDIO_TOKEN=<TOKEN>
   python label_studio_auth.py
 """
 
+from __future__ import annotations
+
+import argparse
+import mimetypes
 import os
 import sqlite3
 from pathlib import Path
+from typing import Any
+from urllib.parse import urlparse
 
-import requests
+import httpx
+from label_studio_sdk import LabelStudio
 
 
 # ---------------------------------------------------------------------------
@@ -25,143 +40,286 @@ import requests
 # ---------------------------------------------------------------------------
 
 DEFAULT_BASE_URL = "http://127.0.0.1:8080"
-DEFAULT_DB_PATH = os.path.expanduser("~/.local/share/label-studio/label_studio.sqlite3")
+DEFAULT_TIMEOUT = 30.0
+
+# 兼容 Unix / Windows 本机 Label Studio 安装路径
+_DB_CANDIDATES = [
+    Path.home() / ".local" / "share" / "label-studio" / "label_studio.sqlite3",
+    Path(os.environ.get("LOCALAPPDATA", "")) / "label-studio" / "label_studio.sqlite3",
+    Path.home() / "AppData" / "Local" / "label-studio" / "label_studio.sqlite3",
+]
+
+
+def default_db_path() -> str:
+    """返回第一个存在的本机 DB 路径；都不存在则返回 Unix 默认路径（供报错提示）。"""
+    for p in _DB_CANDIDATES:
+        if p and str(p) != "." and p.is_file():
+            return str(p)
+    return str(_DB_CANDIDATES[0])
+
+
+DEFAULT_DB_PATH = default_db_path()
 
 
 # ---------------------------------------------------------------------------
-# Token 获取
+# URL / Token 解析
 # ---------------------------------------------------------------------------
 
-def get_token_from_db(db_path: str = DEFAULT_DB_PATH) -> str | None:
-    """从 Label Studio SQLite 数据库中读取 API token。"""
-    if not os.path.exists(db_path):
-        return None
+def resolve_base_url(base_url: str | None = None) -> str:
+    """解析 Label Studio 地址。"""
+    if base_url:
+        return base_url.rstrip("/")
+    for key in ("LABEL_STUDIO_URL", "LABEL_STUDIO_BASE_URL"):
+        val = os.environ.get(key)
+        if val:
+            return val.rstrip("/")
+    return DEFAULT_BASE_URL
 
-    try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-        cursor = conn.execute("SELECT key FROM authtoken_token ORDER BY created DESC LIMIT 1")
-        row = cursor.fetchone()
-        conn.close()
-        if row:
-            return row[0]
-    except (sqlite3.Error, sqlite3.OperationalError) as e:
-        print(f"⚠ 读取 token 数据库失败: {e}")
+
+def is_local_url(base_url: str) -> bool:
+    """判断是否为本机 Label Studio（才允许从本地 SQLite 读 token）。"""
+    host = (urlparse(base_url).hostname or "").lower()
+    return host in ("127.0.0.1", "localhost", "::1") or host.endswith(".localhost")
+
+
+def get_token_from_db(db_path: str | None = None) -> str | None:
+    """从本机 Label Studio SQLite 读取 API token。"""
+    paths: list[str] = []
+    if db_path:
+        paths.append(db_path)
+    else:
+        paths.extend(str(p) for p in _DB_CANDIDATES if p and str(p) != ".")
+
+    seen: set[str] = set()
+    for path in paths:
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        if not os.path.isfile(path):
+            continue
+        try:
+            conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+            try:
+                row = conn.execute(
+                    "SELECT key FROM authtoken_token ORDER BY created DESC LIMIT 1"
+                ).fetchone()
+            finally:
+                conn.close()
+            if row:
+                return row[0]
+        except (sqlite3.Error, sqlite3.OperationalError) as e:
+            print(f"⚠ 读取 token 数据库失败 ({path}): {e}")
     return None
 
 
 def get_token_from_env() -> str | None:
     """从环境变量 LABEL_STUDIO_TOKEN 读取 token。"""
-    return os.environ.get("LABEL_STUDIO_TOKEN")
+    return os.environ.get("LABEL_STUDIO_TOKEN") or None
 
 
-def get_token(db_path: str = DEFAULT_DB_PATH) -> str:
-    """获取 API token，按优先级降级：DB → 环境变量。
+def get_token(
+    db_path: str | None = None,
+    token: str | None = None,
+    base_url: str | None = None,
+    allow_db: bool | None = None,
+) -> str:
+    """获取 API token。
+
+    优先级:
+      1. 显式传入 token
+      2. 环境变量 LABEL_STUDIO_TOKEN
+      3. 本机 SQLite（仅当目标为本地实例，或 allow_db=True）
 
     Raises:
         RuntimeError: 所有来源均未找到 token
     """
-    token = get_token_from_db(db_path)
     if token:
         return token
 
-    token = get_token_from_env()
-    if token:
-        return token
+    env_token = get_token_from_env()
+    if env_token:
+        return env_token
 
+    url = resolve_base_url(base_url)
+    if allow_db is None:
+        allow_db = is_local_url(url)
+
+    if allow_db:
+        db_token = get_token_from_db(db_path)
+        if db_token:
+            return db_token
+
+    db_hint = db_path or DEFAULT_DB_PATH
+    if is_local_url(url):
+        raise RuntimeError(
+            "未找到 Label Studio API token。\n"
+            f"  - 目标: {url}（本机）\n"
+            f"  - 数据库: {db_hint}\n"
+            "  - 环境变量: LABEL_STUDIO_TOKEN 未设置\n"
+            "请先在 Label Studio Web UI 登录，或设置 LABEL_STUDIO_TOKEN。"
+        )
     raise RuntimeError(
         "未找到 Label Studio API token。\n"
-        f"  - 数据库: {db_path}\n"
-        "  - 环境变量: LABEL_STUDIO_TOKEN 未设置\n"
-        "请先在 Label Studio Web UI 中登录，或设置 LABEL_STUDIO_TOKEN 环境变量。"
+        f"  - 目标: {url}（远程，不会读取本机 DB）\n"
+        "  - 请通过 --token 或环境变量 LABEL_STUDIO_TOKEN 提供 Token。\n"
+        "  - Token 可在远程 Label Studio: Account & Settings → Access Token 复制。"
+    )
+
+
+def add_connection_args(parser: argparse.ArgumentParser) -> None:
+    """为 CLI 添加通用连接参数。"""
+    parser.add_argument(
+        "--base-url",
+        default=None,
+        help=(
+            "Label Studio 地址（默认: 环境变量 LABEL_STUDIO_URL / "
+            f"LABEL_STUDIO_BASE_URL，否则 {DEFAULT_BASE_URL}）"
+        ),
+    )
+    parser.add_argument(
+        "--token",
+        default=None,
+        help="API Token（默认: 环境变量 LABEL_STUDIO_TOKEN；本机还可从 SQLite 读取）",
+    )
+    parser.add_argument(
+        "--db",
+        default=None,
+        help=f"本机 SQLite 路径（仅本地实例；默认自动探测，如 {DEFAULT_DB_PATH}）",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=DEFAULT_TIMEOUT,
+        help=f"HTTP 超时秒数（默认: {DEFAULT_TIMEOUT}）",
+    )
+
+
+def client_from_args(args) -> LabelStudioClient:
+    """从 argparse Namespace 构建客户端。"""
+    return get_client(
+        base_url=getattr(args, "base_url", None),
+        token=getattr(args, "token", None),
+        db_path=getattr(args, "db", None),
+        timeout=getattr(args, "timeout", DEFAULT_TIMEOUT),
     )
 
 
 # ---------------------------------------------------------------------------
-# HTTP 客户端
+# SDK 客户端
 # ---------------------------------------------------------------------------
 
-class _LabelStudioClient:
-    """Label Studio API 客户端，封装 HTTP 请求与认证。"""
+def to_dict(obj) -> Any:
+    """把 SDK 返回的模型对象转换为普通 dict / list。"""
+    if isinstance(obj, dict):
+        return obj
+    if isinstance(obj, (list, tuple)):
+        return [to_dict(x) for x in obj]
+    dump = getattr(obj, "model_dump", None)
+    if callable(dump):
+        try:
+            return dump(mode="json")
+        except TypeError:
+            return dump()
+    legacy = getattr(obj, "dict", None)
+    if callable(legacy):
+        return legacy()
+    return obj
 
-    def __init__(self, base_url: str = DEFAULT_BASE_URL, token: str | None = None):
-        self.base_url = base_url.rstrip("/")
-        self.token = token or get_token()
-        self.session = requests.Session()
-        self.session.headers.update({
-            "Authorization": f"Token {self.token}",
-            "Content-Type": "application/json",
-        })
 
-    def _url(self, path: str) -> str:
-        return f"{self.base_url}{path}" if path.startswith("/") else f"{self.base_url}/{path}"
+class LabelStudioClient:
+    """官方 label-studio-sdk 的轻量封装。
 
-    def _unwrap(self, data: dict | list) -> dict | list:
-        """自动解包分页响应 → 数据列表。
+    ``projects`` / ``tasks`` / ``users`` 等命名空间通过 ``__getattr__``
+    直接透传给 SDK，因此可以照常使用::
 
-        Label Studio 不同端点返回不同分页格式:
-        - /api/projects/ → {"count", "results", ...}
-        - /api/tasks/    → {"total", "tasks", ...}
+        client.projects.list()
+        client.tasks.list(project=1)
+        client.users.whoami()
+
+    仅对 SDK 尚未封装的接口（如项目内文件上传）补充便捷方法。
+    """
+
+    def __init__(
+        self,
+        base_url: str = DEFAULT_BASE_URL,
+        token: str | None = None,
+        timeout: float = DEFAULT_TIMEOUT,
+    ):
+        self.base_url = resolve_base_url(base_url)
+        self.token = token or get_token(base_url=self.base_url)
+        self.timeout = timeout
+        self.sdk = LabelStudio(
+            base_url=self.base_url,
+            api_key=self.token,
+            timeout=timeout,
+        )
+
+    def __getattr__(self, name: str):
+        # 未定义的属性/方法交给 SDK（projects、tasks、users、import_storage ...）
+        if name == "sdk":
+            raise AttributeError(name)
+        return getattr(self.sdk, name)
+
+    def _headers(self) -> dict[str, str]:
+        """复用 SDK 的认证头（自动处理旧版 Token / JWT）。"""
+        return self.sdk._client_wrapper.get_headers()
+
+    def whoami(self) -> dict:
+        """当前登录用户信息。"""
+        return to_dict(self.sdk.users.whoami())
+
+    def upload_file(self, project_id: int, file_path: str) -> dict:
+        """上传单个文件并创建为项目任务。
+
+        官方 SDK 2.x 的 ``projects.import_tasks`` 只接受 JSON 任务数据，
+        未封装 multipart 文件上传，因此这里复用 SDK 的认证头直接调用端点。
         """
-        if not isinstance(data, dict):
-            return data
-        if "results" in data:
-            return data["results"]
-        if "tasks" in data:
-            return data["tasks"]
-        return data
-
-    def get(self, path: str, params: dict | None = None) -> dict | list:
-        """发送 GET 请求。"""
-        r = self.session.get(self._url(path), params=params)
-        r.raise_for_status()
-        return self._unwrap(r.json())
-
-    def post(self, path: str, data: dict | None = None, files: dict | None = None) -> dict:
-        """发送 POST 请求。"""
-        if files:
-            r = self.session.post(self._url(path), data=data, files=files)
-        else:
-            r = self.session.post(self._url(path), json=data)
-        r.raise_for_status()
-        return r.json()
-
-    def patch(self, path: str, data: dict) -> dict:
-        """发送 PATCH 请求。"""
-        r = self.session.patch(self._url(path), json=data)
-        r.raise_for_status()
-        return r.json()
-
-    def delete(self, path: str) -> dict:
-        """发送 DELETE 请求。"""
-        r = self.session.delete(self._url(path))
-        r.raise_for_status()
-        return r.json() if r.text else {}
+        mime = mimetypes.guess_type(file_path)[0] or "application/octet-stream"
+        url = f"{self.base_url}/api/projects/{project_id}/import"
+        with open(file_path, "rb") as fh:
+            resp = httpx.post(
+                url,
+                headers=self._headers(),
+                files={"file": (os.path.basename(file_path), fh, mime)},
+                timeout=self.timeout,
+            )
+        resp.raise_for_status()
+        try:
+            return resp.json()
+        except ValueError:
+            return {}
 
 
 # ---------------------------------------------------------------------------
 # 工厂函数
 # ---------------------------------------------------------------------------
 
-_client: _LabelStudioClient | None = None
+_clients: dict[tuple[str, str, float], LabelStudioClient] = {}
 
 
-def get_client(base_url: str = DEFAULT_BASE_URL, token: str | None = None) -> _LabelStudioClient:
-    """获取 Label Studio API 客户端（单例）。
+def get_client(
+    base_url: str | None = None,
+    token: str | None = None,
+    db_path: str | None = None,
+    timeout: float = DEFAULT_TIMEOUT,
+    *,
+    force_new: bool = False,
+) -> LabelStudioClient:
+    """获取 Label Studio SDK 客户端。
 
-    首次调用时自动从 DB/环境变量获取 token，后续调用复用。
-    若后续调用传入不同的 base_url 或 token，会打印警告并使用已缓存的客户端。
+    按 (base_url, token, timeout) 缓存；参数变化时返回对应客户端，不再错误复用本机单例。
     """
-    global _client
-    if _client is None:
-        _client = _LabelStudioClient(base_url=base_url, token=token)
-    else:
-        if base_url != DEFAULT_BASE_URL and base_url != _client.base_url:
-            import warnings
-            warnings.warn(
-                f"get_client(base_url='{base_url}') 被忽略，"
-                f"已缓存客户端指向 {_client.base_url}"
-            )
-    return _client
+    url = resolve_base_url(base_url)
+    tok = get_token(db_path=db_path, token=token, base_url=url)
+    key = (url, tok, float(timeout))
+    if force_new or key not in _clients:
+        _clients[key] = LabelStudioClient(base_url=url, token=tok, timeout=timeout)
+    return _clients[key]
+
+
+def reset_clients() -> None:
+    """清空客户端缓存（测试或切换账号时用）。"""
+    _clients.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -169,37 +327,38 @@ def get_client(base_url: str = DEFAULT_BASE_URL, token: str | None = None) -> _L
 # ---------------------------------------------------------------------------
 
 def main():
-    import argparse
-
     parser = argparse.ArgumentParser(
-        description="Label Studio 认证 —— 获取并验证 API Token",
+        description="Label Studio 认证 —— 验证本机或远程实例的 API Token（SDK）",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "环境变量:\n"
+            "  LABEL_STUDIO_URL / LABEL_STUDIO_BASE_URL  实例地址\n"
+            "  LABEL_STUDIO_TOKEN                       API Token（远程必需）\n"
+        ),
     )
-    parser.add_argument(
-        "--base-url", default=DEFAULT_BASE_URL,
-        help=f"Label Studio 地址（默认: {DEFAULT_BASE_URL}）",
-    )
-    parser.add_argument(
-        "--db", default=DEFAULT_DB_PATH,
-        help="SQLite 数据库路径",
-    )
+    add_connection_args(parser)
     args = parser.parse_args()
 
-    print(f"Label Studio: {args.base_url}")
+    url = resolve_base_url(args.base_url)
+    local = is_local_url(url)
+    print(f"Label Studio: {url}  ({'本机' if local else '远程'})")
 
-    # 尝试获取 token
-    token_db = get_token_from_db(args.db)
     token_env = get_token_from_env()
-
-    print(f"Token (DB):   {'✅ ' + token_db[:8] + '...' if token_db else '❌ 未找到'}")
     print(f"Token (ENV):  {'✅ ' + token_env[:8] + '...' if token_env else '❌ 未设置'}")
+    if local:
+        token_db = get_token_from_db(args.db)
+        print(f"Token (DB):   {'✅ ' + token_db[:8] + '...' if token_db else '❌ 未找到'}")
+    else:
+        print("Token (DB):   ⏭ 远程实例跳过本机数据库")
 
     try:
-        token = get_token(args.db)
+        token = get_token(db_path=args.db, token=args.token, base_url=url)
         print(f"使用 Token:   {token[:8]}...")
 
-        # 验证 token 是否有效
-        client = get_client(args.base_url, token)
-        user_info = client.get("/api/current-user/whoami")
+        client = get_client(
+            base_url=url, token=token, db_path=args.db, timeout=args.timeout, force_new=True,
+        )
+        user_info = client.whoami()
         print(f"用户:         {user_info.get('email', '?')}  (id={user_info.get('id', '?')})")
         print("\n✅ Token 有效，认证成功！")
     except RuntimeError as e:

@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""Label Studio 任务数据管理 —— 增删查、统计。
+"""Label Studio 任务数据管理 —— 增删查、统计（支持本机 / 远程实例）。
 
 示例:
+  # 本机
   python label_studio_data.py list -p 10
-  python label_studio_data.py get 1971
-  python label_studio_data.py delete -p 10 --ids 1,2,3
   python label_studio_data.py stats -p 10
+
+  # 远程
+  python label_studio_data.py --base-url http://192.168.1.10:8080 --token <TOKEN> stats -p 10
 """
 
 import argparse
@@ -13,7 +15,13 @@ import json
 import os
 import sys
 
-from label_studio_auth import get_client
+from label_studio_auth import (
+    add_connection_args,
+    client_from_args,
+    get_client,
+    is_local_url,
+    to_dict,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -28,32 +36,48 @@ def list_tasks(
 ) -> list[dict]:
     """列出指定项目的任务（分页）。"""
     c = client or get_client()
-    return c.get("/api/tasks/", params={
-        "project": project_id,
-        "page": page,
-        "page_size": page_size,
-    })
+    tasks = c.tasks.list(
+        project=project_id,
+        page=page,
+        page_size=page_size,
+        fields="task_only",
+    )
+    return [to_dict(t) for t in tasks]
 
 
 def get_task(task_id: int, client=None) -> dict:
     """获取单个任务详情。"""
     c = client or get_client()
-    return c.get(f"/api/tasks/{task_id}/")
+    return to_dict(c.tasks.get(str(task_id)))
 
 
 def delete_task(task_id: int, client=None) -> dict:
     """删除单个任务。"""
     c = client or get_client()
-    return c.delete(f"/api/tasks/{task_id}/")
+    c.tasks.delete(str(task_id))
+    return {"deleted": 1}
 
 
 def delete_tasks_batch(project_id: int, task_ids: list[int], client=None) -> dict:
-    """批量删除任务。"""
+    """批量删除任务。
+
+    SDK 未提供“按 ID 批量删除”的封装（仅提供清空整个项目），
+    因此逐条调用 ``tasks.delete``，并汇总失败项。
+    """
     c = client or get_client()
-    return c.post("/api/tasks/delete/", data={
-        "project": project_id,
-        "selected_items": {"all": False, "included": task_ids},
-    })
+    deleted = 0
+    errors: list[str] = []
+    for task_id in task_ids:
+        try:
+            c.tasks.delete(str(task_id))
+            deleted += 1
+        except Exception as e:
+            errors.append(f"{task_id}: {e}")
+
+    result = {"deleted": deleted}
+    if errors:
+        result["errors"] = errors
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -67,52 +91,20 @@ def import_tasks_from_images(
 ) -> dict:
     """批量导入本地图片作为标注任务。
 
-    通过 Label Studio 的文件上传 API 将每张图片创建为一个任务。
-    每次请求只发送一张图片，避免单次请求过大导致超时或服务端错误。
-
-    Args:
-        project_id: 目标项目 ID
-        image_paths: 本地图片文件路径列表
-        client: Label Studio 客户端（可选）
-
-    Returns:
-        API 响应 dict，包含 task_count 和 errors 列表
+    通过 SDK 客户端上传每张图片并创建任务。
+    图片从调用方机器读取并上传到目标实例（本机或远程均可）。
     """
-    import mimetypes
-
     c = client or get_client()
-    url = f"{c.base_url}/api/projects/{project_id}/import"
-
-    # 文件上传需要 multipart/form-data，必须临时移除 session 中硬编码的
-    # application/json，否则 Label Studio 会尝试把二进制图片当 JSON 解析
-    ct_header = c.session.headers.pop("Content-Type", None)
 
     total = len(image_paths)
     errors = []
 
-    try:
-        for i, p in enumerate(image_paths, 1):
-            mime_type = mimetypes.guess_type(p)[0] or "image/png"
-            filename = os.path.basename(p)
-            try:
-                with open(p, "rb") as fh:
-                    r = c.session.post(
-                        url,
-                        files={"file": (filename, fh, mime_type)},
-                    )
-                if not r.ok:
-                    try:
-                        detail = r.json()
-                    except Exception:
-                        detail = r.text[:500]
-                    errors.append(f"[{i}/{total}] {filename}: HTTP {r.status_code} — {detail}")
-                    continue
-            except Exception as e:
-                errors.append(f"[{i}/{total}] {filename}: {e}")
-                continue
-    finally:
-        if ct_header:
-            c.session.headers["Content-Type"] = ct_header
+    for i, p in enumerate(image_paths, 1):
+        filename = os.path.basename(p)
+        try:
+            c.upload_file(project_id, p)
+        except Exception as e:
+            errors.append(f"[{i}/{total}] {filename}: {e}")
 
     result = {"task_count": total - len(errors)}
     if errors:
@@ -125,24 +117,18 @@ def import_tasks_from_images(
 # ---------------------------------------------------------------------------
 
 def task_stats(project_id: int, client=None) -> dict:
-    """获取项目任务统计。
-
-    Returns:
-        {total, labeled, unlabeled, has_annotations, has_predictions}
-    """
+    """获取项目任务统计。"""
     c = client or get_client()
-    # 获取项目概览
-    project = c.get(f"/api/projects/{project_id}/")
-    # 获取已标注任务数
-    total = project.get("task_number", 0)
-    annotated = project.get("num_tasks_with_annotations", 0)
+    project = c.projects.get(project_id)
+    total = project.task_number or 0
+    annotated = project.num_tasks_with_annotations or 0
 
     return {
         "total": total,
         "labeled": annotated,
         "unlabeled": total - annotated,
-        "total_annotations": project.get("total_annotations_number", 0),
-        "total_predictions": project.get("total_predictions_number", 0),
+        "total_annotations": project.total_annotations_number or 0,
+        "total_predictions": project.total_predictions_number or 0,
     }
 
 
@@ -151,29 +137,29 @@ def task_stats(project_id: int, client=None) -> dict:
 # ---------------------------------------------------------------------------
 
 def main():
+    conn = argparse.ArgumentParser(add_help=False)
+    add_connection_args(conn)
+
     parser = argparse.ArgumentParser(
-        description="Label Studio 任务数据管理",
+        description="Label Studio 任务数据管理（支持本机 / 远程）",
         formatter_class=argparse.RawDescriptionHelpFormatter,
+        parents=[conn],
     )
     sub = parser.add_subparsers(dest="command", help="操作")
 
-    # ---- list ----
     p_list = sub.add_parser("list", help="列出任务")
     p_list.add_argument("-p", "--project", type=int, required=True, help="项目 ID")
     p_list.add_argument("--page", type=int, default=1, help="页码（默认: 1）")
     p_list.add_argument("--page-size", type=int, default=20, help="每页数量（默认: 20）")
 
-    # ---- get ----
     p_get = sub.add_parser("get", help="查看任务详情")
     p_get.add_argument("task_id", type=int, help="任务 ID")
 
-    # ---- delete ----
     p_del = sub.add_parser("delete", help="批量删除任务")
     p_del.add_argument("-p", "--project", type=int, required=True, help="项目 ID")
     p_del.add_argument("--ids", required=True, help="任务 ID 列表，逗号分隔（如: 1,2,3）")
     p_del.add_argument("--yes", action="store_true", help="跳过确认")
 
-    # ---- stats ----
     p_stats = sub.add_parser("stats", help="任务统计")
     p_stats.add_argument("-p", "--project", type=int, required=True, help="项目 ID")
 
@@ -183,9 +169,11 @@ def main():
         parser.print_help()
         return
 
-    client = get_client()
-
     try:
+        client = client_from_args(args)
+        if not is_local_url(client.base_url):
+            print(f"→ 远程实例: {client.base_url}")
+
         if args.command == "list":
             tasks = list_tasks(args.project, args.page, args.page_size, client)
             if not tasks:
@@ -224,8 +212,9 @@ def main():
                     print("已取消")
                     return
             result = delete_tasks_batch(args.project, ids, client)
-            actual = result.get("deleted", result.get("detail", str(result)))
-            print(f"✅ 删除结果: {actual}（请求 {len(ids)} 个任务）")
+            print(f"✅ 删除结果: {result.get('deleted', 0)}/{len(ids)} 个任务")
+            for err in result.get("errors", []):
+                print(f"  ❌ {err}")
 
         elif args.command == "stats":
             stats = task_stats(args.project, client)
