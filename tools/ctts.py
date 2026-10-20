@@ -632,9 +632,13 @@ def gui_main():
                 _set_status(self._ls_conn_status,
                             f"已连接: {self.client.base_url}", "ok")
                 self._ls_refresh_projects()
+                # 连接状态同步到 ③ 预标注（否则仍显示“请先连接”）
+                self._pre_refresh_models()
+                self._pre_update_connection()
             except Exception as e:
                 self.client = None
                 _set_status(self._ls_conn_status, f"连接失败: {e}", "err")
+                self._pre_update_connection()
                 QMessageBox.warning(self, "连接失败", str(e))
 
         def _ls_require_client(self) -> bool:
