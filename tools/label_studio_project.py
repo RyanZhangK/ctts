@@ -14,6 +14,7 @@
 
 import argparse
 import sys
+from xml.sax.saxutils import escape
 
 from label_studio_auth import (
     add_connection_args,
@@ -56,6 +57,26 @@ PRESET_TEMPLATES = {
 }
 
 
+def detection_label_config(labels: list[str]) -> str:
+    """生成目标检测模板，类别顺序即训练数据 classes.txt 顺序。"""
+    labels = [str(v).strip() for v in labels if str(v).strip()]
+    if not labels:
+        raise ValueError("labels 不能为空")
+    color = "#FF0000"
+    lines = [
+        "<View>",
+        '  <Image name="image" value="$image"/>',
+        '  <RectangleLabels name="label" toName="image">',
+    ]
+    for label in labels:
+        lines.append(f'    <Label value="{escape(label)}" background="{color}"/>')
+    lines += [
+        "  </RectangleLabels>",
+        "</View>",
+    ]
+    return "\n".join(lines)
+
+
 def list_templates():
     """列出所有预设模板。"""
     for name, info in PRESET_TEMPLATES.items():
@@ -82,6 +103,7 @@ def create_project(
     title: str,
     label_config: str | None = None,
     template: str | None = None,
+    labels: list[str] | None = None,
     client=None,
 ) -> dict:
     """创建新项目。"""
@@ -89,6 +111,8 @@ def create_project(
 
     if label_config:
         config = label_config
+    elif labels:
+        config = detection_label_config(labels)
     elif template and template in PRESET_TEMPLATES:
         config = PRESET_TEMPLATES[template]["config"]
     else:
@@ -175,6 +199,14 @@ def main():
         "-t", "--template", choices=list(PRESET_TEMPLATES.keys()),
         default="detection", help="预设模板（默认: detection）",
     )
+    p_create.add_argument(
+        "--labels", default=None,
+        help="检测类别，逗号分隔（如: stb,person）；优先于模板",
+    )
+    p_create.add_argument(
+        "--labels-file", default=None,
+        help="从 classes.txt 读取类别（每行一个）",
+    )
 
     p_del = sub.add_parser("delete", help="删除项目")
     p_del.add_argument("project_id", type=int, help="项目 ID")
@@ -232,7 +264,15 @@ def main():
             print(f"label_config:\n{p.get('label_config', '(无)')}")
 
         elif args.command == "create":
-            p = create_project(args.title, template=args.template, client=client)
+            labels = None
+            if args.labels_file:
+                labels = [line.strip() for line in
+                          open(args.labels_file, encoding="utf-8")
+                          if line.strip()]
+            elif args.labels:
+                labels = [v.strip() for v in args.labels.split(",") if v.strip()]
+            p = create_project(args.title, template=args.template,
+                               labels=labels, client=client)
             print(f"✅ 项目已创建  ID={p['id']}  标题='{p.get('title', '')}'")
             print(f"   模板: {args.template} ({PRESET_TEMPLATES[args.template]['description']})")
 

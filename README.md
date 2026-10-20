@@ -20,8 +20,13 @@ ctts/
 │   ├── label_studio_project.py  # LS 项目管理
 │   ├── label_studio_data.py     # LS 任务 CRUD
 │   ├── label_studio_main.py     # LS CLI 入口
+│   ├── prelabel.py        # ★ 小模型预标注流水线
+│   ├── test_prelabel.py   # 预标注离线单测（无需 LS/GPU）
 │   ├── pyproject.toml     # uv 依赖声明
 │   └── .gitignore
+├── docs/                  # 设计文档
+│   └── prelabel_design.md # 预标注功能设计
+├── runs/prelabel/         # 预标注产物（不纳入版本控制）
 ├── dataset/               # 数据集（不纳入版本控制）
 │   ├── RawData/           # 原始图片
 │   └── LabelData/         # 标注后数据 (images/ labels/ data.yaml)
@@ -76,6 +81,13 @@ python ctts.py label project create "新项目"           # 创建项目
 python ctts.py label data stats -p 10                  # 标注进度
 python ctts.py label data list -p 10                   # 查看任务
 
+# 小模型预标注（评估 → 建微数据集 → 训练 nano → 导出 ONNX → 预标注）
+python ctts.py prelabel assess -p 10                   # 只评估数据是否足够
+python ctts.py prelabel run -p 10                      # 全流程
+python ctts.py prelabel build -p 10 --out /tmp/ds      # 只构建微数据集
+python ctts.py prelabel train --data /tmp/ds           # 只训练并导出 ONNX
+python ctts.py prelabel predict -p 10 -m runs/prelabel/<run>/model/best.onnx
+
 # 训练
 python ctts.py train                                   # 使用 yolo_train.py 配置
 
@@ -91,11 +103,34 @@ source ~/.cache/ctts-venv/bin/activate
 python ctts.py --gui
 ```
 
-GUI 包含四个 Tab：
+GUI 包含六个 Tab：
 - **📦 数据准备** — 视频抽帧、质量过滤、数据集划分
 - **🏷️ 标注管理** — Label Studio 项目与任务管理
+- **🎯 预标注** — 评估数据 → 训练小模型 → API 预标注 → 复核
+- **🗂️ 数据集划分** — 已标注数据划分为 train/val
 - **🚀 训练** — YOLO 训练参数配置与启动
 - **🔍 推理** — 实时检测窗口启动
+
+### 小模型预标注
+
+人工只标一小部分，用 nano 模型先标剩下的，再人工复核，可显著减少重复劳动。
+
+流程（一个 Tab 内完成，也可用 `ctts.py prelabel`）：
+
+1. **评估数据就绪度** — 通过 Label Studio API 统计已标注任务、实例数、类别覆盖；
+   默认门槛：≥50 张、≥100 框、每类 ≥30 框。达到一半（25/50/15）判为「勉强可训练」，
+   会弹窗确认；不足则明确提示还差多少。
+2. **构建微数据集** — 只下载/匹配已标注图片，百分比坐标直接转 YOLO 归一化坐标，
+   无效框丢弃并计数，复用 `split_dataset` 划分 train/val。
+3. **训练并导出** — 以 `weights/yolo26n.pt` 为基座微调，导出 `best.onnx` 并做加载自检。
+4. **API 预标注** — 只处理未标注任务，分批写入 Label Studio predictions；
+   同一版本标签默认跳过，勾选「覆盖」才会重写。
+5. **人工复核** — 在 Label Studio 中确认/修正预测并提交；工具不会自动接受预测。
+
+产物固定落在 `runs/prelabel/<run_id>/`（dataset、train、model、report.json、run.log），
+版本标签形如 `ctts-prelabel:v1@480`，可在「仅预标注」时复用历史模型。
+
+> 复核抽样 CSV 与待复核数量统计在「④ 复核」分组；预测框不会被自动确认为标注。
 
 ## Label Studio 集成
 
@@ -137,15 +172,19 @@ python ctts.py label project storage-sync 1
 
 # 4. 在 Label Studio Web UI 完成人工标注
 
-# 5. 导出标注（Label Studio Web UI → Export → YOLO）
+# 5. 小模型预标注（可选；数据达到 50 张 / 100 框后）
+python ctts.py prelabel run -p 10
+# → 回到 Label Studio 复核预测框并提交
 
-# 6. 划分数据集
+# 6. 导出标注（Label Studio Web UI → Export → YOLO）
+
+# 7. 划分数据集
 python ctts.py data split dataset/LabelData/ -v 0.2
 
-# 7. 训练
+# 8. 训练
 python ctts.py train
 
-# 8. 推理验证
+# 9. 推理验证
 python ctts.py detect --video test.mp4 -w weights/best.pt
 ```
 
@@ -157,7 +196,7 @@ python ctts.py detect --video test.mp4 -w weights/best.pt
 | numpy | 数值计算 |
 | ultralytics | YOLO 训练与推理 |
 | PySide6 | 图形界面 |
-| requests | Label Studio API |
+| label-studio-sdk | Label Studio API（含 httpx） |
 
 通过 `uv sync` 一键安装全部依赖。
 
