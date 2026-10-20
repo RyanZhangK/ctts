@@ -12,6 +12,8 @@ CLI 示例:
   # 远程 Label Studio（参数跟在子模块后）
   python ctts.py label project -- --base-url http://192.168.1.10:8080 --token <TOKEN> list
   python ctts.py train
+  python ctts.py prelabel assess -p 10
+  python ctts.py prelabel run -p 10
   python ctts.py detect --cam 0
 
 GUI 模式:
@@ -21,6 +23,9 @@ GUI 模式:
 import argparse
 import os
 import sys
+import threading
+import webbrowser
+from pathlib import Path
 
 
 # ---------------------------------------------------------------------------
@@ -62,6 +67,11 @@ def cli_main():
     p_detect = sub.add_parser("detect", help="YOLO 推理")
     p_detect.add_argument("args", nargs=argparse.REMAINDER, help="传递给 detect 的参数")
 
+    # ---- prelabel ----
+    p_prelabel = sub.add_parser("prelabel", help="小模型预标注流水线（评估→建集→训练→预标注）")
+    p_prelabel.add_argument("args", nargs=argparse.REMAINDER,
+                            help="传递给 prelabel 的参数")
+
     args = parser.parse_args()
 
     if args.gui:
@@ -98,22 +108,27 @@ def cli_main():
     elif args.module == "detect":
         _forward_detect(args.args if hasattr(args, "args") else [])
 
+    # ---- 预标注模块 ----
+    elif args.module == "prelabel":
+        _forward_module("prelabel", getattr(args, "args", []))
+
 
 def _forward_to_module(mapping: dict, action: str, parser, extra_args: list | None = None):
     """将 CLI 请求转发到对应的工具模块。"""
     if action not in mapping:
         parser.print_help()
         return
+    _forward_module(mapping[action], extra_args)
 
-    mod_name = mapping[action]
+
+def _forward_module(mod_name: str, extra_args: list | None = None):
+    """重建 sys.argv 并调用工具模块的 main()。"""
     # 重建 sys.argv: ctts.py data build ... → dataset_build.py ...
     sys.argv = [mod_name + ".py"]
     if extra_args:
         # 去掉 REMAINDER 捕获的 "--" 分隔符
-        filtered = [a for a in extra_args if a != "--"]
-        sys.argv += filtered
+        sys.argv += [a for a in extra_args if a != "--"]
 
-    # 动态导入并调用 main
     import importlib
     mod = importlib.import_module(mod_name)
     mod.main()
@@ -148,7 +163,7 @@ def gui_main():
         sys.path.insert(0, tools_dir)
 
     try:
-        from PySide6.QtCore import Qt, QThread, Signal
+        from PySide6.QtCore import Qt, QThread, QTimer, Signal
         from PySide6.QtGui import QFont
         from PySide6.QtWidgets import (
             QApplication, QWidget, QVBoxLayout, QHBoxLayout,
@@ -156,7 +171,7 @@ def gui_main():
             QTableWidget, QTableWidgetItem, QHeaderView, QMessageBox,
             QGroupBox, QFormLayout, QSpinBox, QProgressBar,
             QMainWindow, QFileDialog, QTextEdit, QComboBox,
-            QCheckBox, QDoubleSpinBox, QSlider,
+            QCheckBox, QDoubleSpinBox, QSlider, QScrollArea,
         )
     except ModuleNotFoundError:
         venv_dir = os.path.expanduser(os.environ.get("CTTS_VENV", "~/.cache/ctts-venv"))
@@ -206,9 +221,43 @@ def gui_main():
         list_tasks = delete_tasks_batch = task_stats = import_tasks_from_images = None
         print(f"⚠ Label Studio 模块加载失败（标注页将不可用）: {e}")
 
+    PRIMARY_BTN_QSS = "font-size: 14px; padding: 8px;"
+    MUTED_QSS = "color: gray;"
+    STATUS_COLORS = {"ok": "green", "warn": "orange", "err": "red", "idle": "gray"}
+
+    def _set_status(label: QLabel, text: str, level: str = "idle") -> None:
+        label.setText(text)
+        label.setStyleSheet(f"color: {STATUS_COLORS.get(level, 'gray')};")
+
+    # ---- PrelabelWorker ----
+    class PrelabelWorker(QThread):
+        """预标注流水线线程：日志 + 阶段事件 + 结果。"""
+
+        log_line = Signal(str)
+        event = Signal(object)
+        finished = Signal(object)
+        error = Signal(str)
+
+        def __init__(self, fn):
+            super().__init__()
+            self.fn = fn
+
+        def run(self):
+            try:
+                self.finished.emit(self.fn(log=self._log, on_event=self._event))
+            except Exception as e:
+                self.error.emit(str(e))
+
+        def _log(self, msg: str):
+            self.log_line.emit(msg)
+
+        def _event(self, event):
+            self.event.emit(event)
+
     # ---- StreamWorker ----
     class StreamWorker(QThread):
         log_line = Signal(str)
+        progress = Signal(int, int)
         finished = Signal(object)
         error = Signal(str)
 
@@ -257,11 +306,13 @@ def gui_main():
             layout.addWidget(self._progress)
 
             tabs = QTabWidget()
+            self._tabs = tabs
             tabs.addTab(self._build_data_tab(), "① 数据准备")
             tabs.addTab(self._build_label_tab(), "② 标注管理")
-            tabs.addTab(self._build_split_tab(), "③ 数据集划分")
-            tabs.addTab(self._build_train_tab(), "④ 训练")
-            tabs.addTab(self._build_detect_tab(), "⑤ 推理")
+            tabs.addTab(self._build_prelabel_tab(), "③ 预标注")
+            tabs.addTab(self._build_split_tab(), "④ 数据集划分")
+            tabs.addTab(self._build_train_tab(), "⑤ 训练")
+            tabs.addTab(self._build_detect_tab(), "⑥ 推理")
             layout.addWidget(tabs)
 
             # 共享日志输出
@@ -270,6 +321,13 @@ def gui_main():
             self._log_output.setMaximumHeight(150)
             self._log_output.setPlaceholderText("操作日志将显示在这里...")
             layout.addWidget(self._log_output)
+
+            # 项目 ID 与 ② 标注管理联动；初始化连接状态
+            self._ls_task_project.valueChanged.connect(self._pre_project.setValue)
+            self._pre_project.valueChanged.connect(self._ls_task_project.setValue)
+            self._pre_project.valueChanged.connect(self._pre_on_project_changed)
+            self._pre_refresh_models()
+            self._pre_update_connection()
 
         # ============================================================
         # ① 数据准备 Tab
@@ -465,12 +523,11 @@ def gui_main():
             btn_connect = QPushButton("连接 / 重连")
             btn_connect.clicked.connect(self._ls_reconnect)
             conn_btn_row.addWidget(btn_connect)
-            self._ls_conn_status = QLabel(
-                f"已连接: {self.client.base_url}" if self.client else "未连接"
-            )
-            self._ls_conn_status.setStyleSheet(
-                "color: green;" if self.client else "color: orange;"
-            )
+            self._ls_conn_status = QLabel()
+            _set_status(
+                self._ls_conn_status,
+                f"已连接: {self.client.base_url}" if self.client else "未连接",
+                "ok" if self.client else "warn")
             conn_btn_row.addWidget(self._ls_conn_status)
             conn_btn_row.addStretch()
             cl.addRow(conn_btn_row)
@@ -480,9 +537,9 @@ def gui_main():
             grp_proj = QGroupBox("项目列表")
             pl = QVBoxLayout(grp_proj)
             btn_row = QHBoxLayout()
-            btn_refresh = QPushButton("刷新")
-            btn_refresh.clicked.connect(self._ls_refresh_projects)
-            btn_row.addWidget(btn_refresh)
+            self._ls_refresh_btn = QPushButton("刷新")
+            self._ls_refresh_btn.clicked.connect(self._ls_refresh_projects)
+            btn_row.addWidget(self._ls_refresh_btn)
             btn_create = QPushButton("新建项目")
             btn_create.clicked.connect(self._ls_create_project)
             btn_row.addWidget(btn_create)
@@ -491,12 +548,24 @@ def gui_main():
             btn_del.clicked.connect(self._ls_delete_project)
             btn_row.addWidget(btn_del)
             btn_row.addStretch()
+            self._ls_auto_cb = QCheckBox("自动刷新")
+            self._ls_auto_cb.setChecked(True)
+            self._ls_auto_cb.setToolTip("停留在本页时每 15 秒静默刷新项目状态")
+            self._ls_auto_cb.toggled.connect(self._ls_toggle_auto)
+            btn_row.addWidget(self._ls_auto_cb)
+            self._ls_last_refresh = QLabel("尚未刷新")
+            _set_status(self._ls_last_refresh, "尚未刷新", "idle")
+            btn_row.addWidget(self._ls_last_refresh)
             pl.addLayout(btn_row)
 
             self._ls_project_table = QTableWidget()
-            self._ls_project_table.setColumnCount(3)
-            self._ls_project_table.setHorizontalHeaderLabels(["ID", "标题", "任务数"])
+            self._ls_project_table.setColumnCount(5)
+            self._ls_project_table.setHorizontalHeaderLabels(
+                ["ID", "标题", "任务数", "已标注", "进度"])
             self._ls_project_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+            for col in (0, 2, 3, 4):
+                self._ls_project_table.horizontalHeader().setSectionResizeMode(
+                    col, QHeaderView.ResizeToContents)
             self._ls_project_table.setSelectionBehavior(QTableWidget.SelectRows)
             self._ls_project_table.setEditTriggers(QTableWidget.NoEditTriggers)
             self._ls_project_table.itemSelectionChanged.connect(self._ls_on_project_selected)
@@ -549,16 +618,23 @@ def gui_main():
             btn_folder = QPushButton("选择文件夹...")
             btn_folder.clicked.connect(self._ls_select_folder)
             up_row.addWidget(btn_folder)
-            btn_upload = QPushButton("上传")
-            btn_upload.setStyleSheet("font-weight: bold;")
-            btn_upload.clicked.connect(self._ls_upload_images)
-            up_row.addWidget(btn_upload)
+            self._ls_upload_btn = QPushButton("上传")
+            self._ls_upload_btn.setStyleSheet(PRIMARY_BTN_QSS)
+            self._ls_upload_btn.clicked.connect(self._ls_upload_images)
+            up_row.addWidget(self._ls_upload_btn)
             up_row.addStretch()
             ul.addLayout(up_row)
             self._ls_upload_info = QLabel("未选择文件")
-            self._ls_upload_info.setStyleSheet("color: gray;")
+            _set_status(self._ls_upload_info, "未选择文件", "idle")
             ul.addWidget(self._ls_upload_info)
             layout.addWidget(grp_upload)
+
+            # 自动刷新：连接成功且停留在 ② 页签时，每 15s 静默刷新项目状态
+            self._ls_connected_ok = False
+            self._ls_auto_busy = False
+            self._ls_timer = QTimer(self)
+            self._ls_timer.setInterval(15000)
+            self._ls_timer.timeout.connect(self._ls_auto_tick)
 
             # 已自动连上则刷新；否则等用户点「连接 / 重连」
             if self.client is not None:
@@ -574,13 +650,20 @@ def gui_main():
                 self.client = get_client(base_url=url, token=token, force_new=True)
                 # 轻量探测（SDK）
                 self.client.whoami()
-                self._ls_conn_status.setText(f"已连接: {self.client.base_url}")
-                self._ls_conn_status.setStyleSheet("color: green;")
+                _set_status(self._ls_conn_status,
+                            f"已连接: {self.client.base_url}", "ok")
+                self._ls_connected_ok = True
+                self._ls_timer.start()
                 self._ls_refresh_projects()
+                # 连接状态同步到 ③ 预标注（否则仍显示“请先连接”）
+                self._pre_refresh_models()
+                self._pre_update_connection()
             except Exception as e:
                 self.client = None
-                self._ls_conn_status.setText(f"连接失败: {e}")
-                self._ls_conn_status.setStyleSheet("color: red;")
+                self._ls_connected_ok = False
+                self._ls_timer.stop()
+                _set_status(self._ls_conn_status, f"连接失败: {e}", "err")
+                self._pre_update_connection()
                 QMessageBox.warning(self, "连接失败", str(e))
 
         def _ls_require_client(self) -> bool:
@@ -589,21 +672,90 @@ def gui_main():
                 return False
             return True
 
-        def _ls_refresh_projects(self):
+        def _ls_refresh_projects(self, quiet: bool = False):
             if not self._ls_require_client():
                 return
+            if self._ls_auto_busy:
+                return
+            self._ls_auto_busy = True
+            self._ls_refresh_btn.setEnabled(False)
+            if not quiet:
+                _set_status(self._ls_last_refresh, "刷新中…", "warn")
+            selected = self._ls_selected_project_id()
+
+            def settle():
+                self._ls_auto_busy = False
+                self._ls_refresh_btn.setEnabled(True)
+
             self._run_task(
                 lambda: list_projects(self.client),
-                lambda ps: self._ls_populate_projects(ps),
+                lambda ps: self._ls_populate_projects(ps, selected),
                 "加载项目",
+                show_progress=not quiet,
+                quiet_errors=quiet,
+                on_settle=settle,
+                on_error=lambda e: _set_status(
+                    self._ls_last_refresh, "刷新失败", "err"),
             )
 
-        def _ls_populate_projects(self, projects):
-            self._ls_project_table.setRowCount(len(projects))
+        def _ls_selected_project_id(self):
+            rows = self._ls_project_table.selectionModel().selectedRows()
+            if not rows:
+                return None
+            item = self._ls_project_table.item(rows[0].row(), 0)
+            return int(item.text()) if item else None
+
+        def _ls_populate_projects(self, projects, select_id=None):
+            self._ls_connected_ok = True
+            table = self._ls_project_table
+            table.blockSignals(True)
+            table.setRowCount(len(projects))
             for i, p in enumerate(projects):
-                self._ls_project_table.setItem(i, 0, QTableWidgetItem(str(p["id"])))
-                self._ls_project_table.setItem(i, 1, QTableWidgetItem(p.get("title", "")))
-                self._ls_project_table.setItem(i, 2, QTableWidgetItem(str(p.get("task_number", 0))))
+                pid = p["id"]
+                total = p.get("task_number") or 0
+                labeled = p.get("num_tasks_with_annotations") or 0
+                pct = f"{labeled / total * 100:.0f}%" if total else "—"
+                table.setItem(i, 0, QTableWidgetItem(str(pid)))
+                table.setItem(i, 1, QTableWidgetItem(p.get("title", "")))
+                table.setItem(i, 2, QTableWidgetItem(str(total)))
+                table.setItem(i, 3, QTableWidgetItem(str(labeled)))
+                item = QTableWidgetItem(pct)
+                item.setToolTip(f"{labeled} / {total}")
+                table.setItem(i, 4, item)
+            table.blockSignals(False)
+            table.clearSelection()
+            if select_id is not None:
+                # 静默恢复选中行：不触发 selectionChanged，避免自动刷新覆盖
+                # 用户手动输入的任务/上传项目 ID。
+                table.blockSignals(True)
+                for row in range(table.rowCount()):
+                    if table.item(row, 0).text() == str(select_id):
+                        table.selectRow(row)
+                        break
+                table.blockSignals(False)
+            if self._ls_auto_cb.isChecked() and not self._ls_timer.isActive():
+                self._ls_timer.start()
+            from datetime import datetime as _dt
+            _set_status(self._ls_last_refresh,
+                        f"最后刷新 {_dt.now():%H:%M:%S}", "ok")
+
+        def _ls_toggle_auto(self, enabled: bool):
+            if enabled and self._ls_connected_ok:
+                self._ls_timer.start()
+                self._ls_auto_tick()
+            elif not enabled:
+                self._ls_timer.stop()
+
+        def _ls_auto_tick(self):
+            if not self._ls_auto_cb.isChecked():
+                return
+            if not self._ls_connected_ok or self.client is None:
+                return
+            if self._ls_auto_busy or self._workers:
+                return
+            if getattr(self, "_tabs", None) is not None and self._tabs.currentIndex() != 1:
+                return
+            self._ls_refresh_projects(quiet=True)
 
         def _ls_on_project_selected(self):
             """项目列表选中行时，自动同步项目 ID 到任务管理和上传区域。"""
@@ -712,8 +864,8 @@ def gui_main():
             )
             if paths:
                 self._ls_image_paths = paths
-                self._ls_upload_info.setText(f"已选择 {len(paths)} 张图片")
-                self._ls_upload_info.setStyleSheet("color: green;")
+                _set_status(self._ls_upload_info,
+                            f"已选择 {len(paths)} 张图片", "ok")
 
         def _ls_select_folder(self):
             """选择文件夹，递归扫描其中所有图片。"""
@@ -722,11 +874,11 @@ def gui_main():
                 paths = self._scan_images(folder)
                 self._ls_image_paths = paths
                 if paths:
-                    self._ls_upload_info.setText(f"已选择 {len(paths)} 张图片（来自 {folder}）")
-                    self._ls_upload_info.setStyleSheet("color: green;")
+                    _set_status(self._ls_upload_info,
+                                f"已选择 {len(paths)} 张图片（来自 {folder}）", "ok")
                 else:
-                    self._ls_upload_info.setText(f"文件夹内无图片: {folder}")
-                    self._ls_upload_info.setStyleSheet("color: orange;")
+                    _set_status(self._ls_upload_info,
+                                f"文件夹内无图片: {folder}", "warn")
 
         def _ls_upload_images(self):
             """批量上传图片到 Label Studio 项目。"""
@@ -747,8 +899,15 @@ def gui_main():
             if ans != QMessageBox.Yes:
                 return
 
-            def do_upload():
-                return import_tasks_from_images(pid, paths, client=self.client)
+            total = len(paths)
+            holder = {}
+
+            def do_upload(log):
+                return import_tasks_from_images(
+                    pid, paths, client=self.client,
+                    progress=lambda done, n: holder["w"].progress.emit(done, n),
+                    log=log,
+                )
 
             def on_done(result):
                 n = result.get("task_count", 0)
@@ -756,19 +915,669 @@ def gui_main():
                 if errs:
                     detail = "\n".join(errs[:10])
                     more = f"\n... 还有 {len(errs) - 10} 个错误" if len(errs) > 10 else ""
+                    _set_status(self._ls_upload_info,
+                                f"上传完成 {n}/{total}，失败 {len(errs)}", "err")
                     QMessageBox.warning(self, "上传完成（有错误）",
                         f"成功 {n} 个，失败 {len(errs)} 个\n\n失败详情:\n{detail}{more}")
                 else:
+                    _set_status(self._ls_upload_info,
+                                f"上传完成 {n}/{total}（项目 {pid}）", "ok")
                     QMessageBox.information(self, "上传完成",
                         f"已导入 {n} 个任务到项目 {pid}")
                 self._ls_image_paths = []
-                self._ls_upload_info.setText("未选择文件")
-                self._ls_upload_info.setStyleSheet("color: gray;")
-                # 刷新任务列表
+                self._ls_upload_btn.setEnabled(True)
+                # 上传后自动刷新：项目计数 + 当前任务列表，不再依赖手动刷新
+                self._ls_refresh_projects(quiet=True)
                 if self._ls_task_project.value() == pid:
                     self._ls_load_tasks()
 
-            self._run_task(do_upload, on_done, "上传图片")
+            def on_fail(message):
+                self._ls_upload_btn.setEnabled(True)
+                _set_status(self._ls_upload_info, f"上传失败: {message}", "err")
+
+            self._show_progress(True)
+            self._progress.setRange(0, max(total, 1))
+            self._progress.setValue(0)
+            self._ls_upload_btn.setEnabled(False)
+            worker = StreamWorker(do_upload)
+            holder["w"] = worker
+            worker.progress.connect(
+                lambda done, n: self._ls_upload_progress(done, n, pid))
+            worker.finished.connect(on_done)
+            worker.finished.connect(lambda _: self._show_progress(False))
+            worker.finished.connect(lambda _: (worker.deleteLater(),
+                self._workers.remove(worker) if worker in self._workers else None))
+            worker.error.connect(on_fail)
+            worker.error.connect(lambda e: (
+                QMessageBox.critical(self, "上传失败", str(e)),
+                self._show_progress(False)))
+            worker.error.connect(lambda _: (worker.deleteLater(),
+                self._workers.remove(worker) if worker in self._workers else None))
+            self._workers.append(worker)
+            worker.start()
+
+        def _ls_upload_progress(self, done: int, total: int, pid: int):
+            self._set_progress(done, total)
+            _set_status(self._ls_upload_info,
+                        f"上传中 {done}/{total} → 项目 {pid}", "warn")
+
+        # ============================================================
+        # ③ 预标注 Tab
+        # ============================================================
+        _PRE_STAGES = ["评估", "建集", "训练", "导出", "预标注"]
+        _PRE_STAGE_KEYS = ["assess", "dataset", "train", "export", "prelabel"]
+
+        def _build_prelabel_tab(self) -> QWidget:
+            self._pre_running = False
+            self._pre_worker = None
+            self._pre_label_cancel = threading.Event()
+            self._pre_current_stage = None
+            self._pre_pending_pipeline = False
+            self._pre_last_run_dir = None
+
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            w = QWidget()
+            scroll.setWidget(w)
+            layout = QVBoxLayout(w)
+
+            self._pre_conn_hint = QLabel("请先在 ② 标注管理连接 Label Studio")
+            _set_status(self._pre_conn_hint, self._pre_conn_hint.text(), "warn")
+            layout.addWidget(self._pre_conn_hint)
+
+            # ---- ① 数据就绪 ----
+            grp = QGroupBox("① 数据就绪")
+            fl = QFormLayout(grp)
+            row = QHBoxLayout()
+            row.addWidget(QLabel("项目 ID:"))
+            self._pre_project = QSpinBox()
+            self._pre_project.setRange(1, 999999)
+            self._pre_project.setValue(10)
+            row.addWidget(self._pre_project)
+            self._pre_check_btn = QPushButton("检查数据")
+            self._pre_check_btn.clicked.connect(self._pre_assess_only)
+            row.addWidget(self._pre_check_btn)
+            row.addStretch()
+            self._pre_verdict = QLabel("未评估")
+            _set_status(self._pre_verdict, "未评估", "idle")
+            row.addWidget(self._pre_verdict)
+            fl.addRow(row)
+
+            self._pre_summary = QLabel("—")
+            _set_status(self._pre_summary, "—", "idle")
+            fl.addRow("摘要:", self._pre_summary)
+
+            self._pre_detail_btn = QPushButton("查看明细 ▸")
+            self._pre_detail_btn.setCheckable(True)
+            self._pre_detail_btn.toggled.connect(self._pre_toggle_detail)
+            fl.addRow(self._pre_detail_btn)
+
+            self._pre_detail_table = QTableWidget(0, 4)
+            self._pre_detail_table.setHorizontalHeaderLabels(["检查项", "门槛", "实测", "结论"])
+            self._pre_detail_table.horizontalHeader().setSectionResizeMode(
+                0, QHeaderView.Stretch)
+            self._pre_detail_table.setSelectionBehavior(QTableWidget.SelectRows)
+            self._pre_detail_table.setEditTriggers(QTableWidget.NoEditTriggers)
+            self._pre_detail_table.setMaximumHeight(150)
+            self._pre_detail_table.setVisible(False)
+            fl.addRow(self._pre_detail_table)
+            layout.addWidget(grp)
+
+            # ---- ② 微数据集与模型 ----
+            grp2 = QGroupBox("② 微数据集与模型")
+            fl2 = QFormLayout(grp2)
+            wrow = QHBoxLayout()
+            self._pre_weights = QLineEdit("weights/yolo26n.pt")
+            wrow.addWidget(self._pre_weights)
+            self._pre_weights_btn = QPushButton("浏览")
+            self._pre_weights_btn.clicked.connect(
+                lambda: self._browse_file(self._pre_weights, "权重 (*.pt)"))
+            wrow.addWidget(self._pre_weights_btn)
+            fl2.addRow("基座权重:", wrow)
+
+            params = QHBoxLayout()
+            params.addWidget(QLabel("尺寸:"))
+            self._pre_imgsz = QSpinBox()
+            self._pre_imgsz.setRange(320, 1280)
+            self._pre_imgsz.setSingleStep(160)
+            self._pre_imgsz.setValue(480)
+            params.addWidget(self._pre_imgsz)
+            params.addWidget(QLabel("轮数:"))
+            self._pre_epochs = QSpinBox()
+            self._pre_epochs.setRange(10, 1000)
+            self._pre_epochs.setValue(150)
+            params.addWidget(self._pre_epochs)
+            params.addWidget(QLabel("冻结:"))
+            self._pre_freeze = QSpinBox()
+            self._pre_freeze.setRange(0, 23)
+            self._pre_freeze.setValue(8)
+            params.addWidget(self._pre_freeze)
+            params.addWidget(QLabel("设备:"))
+            self._pre_device = QComboBox()
+            self._pre_device.addItems(["自动", "CPU", "GPU"])
+            params.addWidget(self._pre_device)
+            params.addStretch()
+            fl2.addRow(params)
+
+            arow = QHBoxLayout()
+            self._pre_artifact = QLabel("上次产物: —")
+            _set_status(self._pre_artifact, "上次产物: —", "idle")
+            arow.addWidget(self._pre_artifact)
+            self._pre_open_dir_btn = QPushButton("打开目录")
+            self._pre_open_dir_btn.clicked.connect(self._pre_open_dir)
+            arow.addWidget(self._pre_open_dir_btn)
+            arow.addStretch()
+            fl2.addRow(arow)
+            layout.addWidget(grp2)
+
+            # ---- ③ 预标注 ----
+            grp3 = QGroupBox("③ 预标注")
+            fl3 = QFormLayout(grp3)
+            mrow = QHBoxLayout()
+            self._pre_model = QComboBox()
+            self._pre_model.addItem("自动：最新 ONNX", "")
+            mrow.addWidget(self._pre_model)
+            self._pre_model_btn = QPushButton("选择…")
+            self._pre_model_btn.clicked.connect(self._pre_choose_model)
+            mrow.addWidget(self._pre_model_btn)
+            fl3.addRow("模型:", mrow)
+
+            prow = QHBoxLayout()
+            prow.addWidget(QLabel("置信度:"))
+            self._pre_conf = QDoubleSpinBox()
+            self._pre_conf.setRange(0.01, 0.99)
+            self._pre_conf.setSingleStep(0.05)
+            self._pre_conf.setDecimals(2)
+            self._pre_conf.setValue(0.25)
+            prow.addWidget(self._pre_conf)
+            prow.addWidget(QLabel("IOU:"))
+            self._pre_iou = QDoubleSpinBox()
+            self._pre_iou.setRange(0.10, 0.95)
+            self._pre_iou.setSingleStep(0.05)
+            self._pre_iou.setDecimals(2)
+            self._pre_iou.setValue(0.70)
+            prow.addWidget(self._pre_iou)
+            self._pre_skip = QCheckBox("跳过同版本预测")
+            self._pre_skip.setChecked(True)
+            prow.addWidget(self._pre_skip)
+            self._pre_overwrite = QCheckBox("覆盖同版本")
+            prow.addWidget(self._pre_overwrite)
+            self._pre_skip.toggled.connect(
+                lambda on: self._pre_overwrite.setEnabled(not on))
+            self._pre_overwrite.setEnabled(False)
+            prow.addStretch()
+            fl3.addRow(prow)
+
+            self._pre_tag = QLabel("版本标签: —")
+            _set_status(self._pre_tag, "版本标签: —", "idle")
+            fl3.addRow(self._pre_tag)
+            layout.addWidget(grp3)
+
+            # ---- ④ 复核 ----
+            grp4 = QGroupBox("④ 复核")
+            rl = QHBoxLayout(grp4)
+            self._pre_review = QLabel("待复核 — 张 · 已提交 — 张")
+            _set_status(self._pre_review, "待复核 — 张 · 已提交 — 张", "idle")
+            rl.addWidget(self._pre_review)
+            rl.addStretch()
+            btn_ls = QPushButton("打开 Label Studio")
+            btn_ls.clicked.connect(self._pre_open_ls)
+            rl.addWidget(btn_ls)
+            btn_csv = QPushButton("导出抽样 CSV")
+            btn_csv.clicked.connect(self._pre_export_sample)
+            rl.addWidget(btn_csv)
+            layout.addWidget(grp4)
+
+            # ---- 阶段芯片 ----
+            chip_row = QHBoxLayout()
+            self._pre_chips = []
+            for name in self._PRE_STAGES:
+                chip = QLabel(f"○ {name}")
+                _set_status(chip, f"○ {name}", "idle")
+                self._pre_chips.append(chip)
+                chip_row.addWidget(chip)
+            chip_row.addStretch()
+            layout.addLayout(chip_row)
+
+            self._pre_status = QLabel("请先评估数据")
+            _set_status(self._pre_status, "请先评估数据", "idle")
+            layout.addWidget(self._pre_status)
+
+            # ---- 操作按钮 ----
+            brow = QHBoxLayout()
+            self._pre_run_btn = QPushButton("评估并预标注")
+            self._pre_run_btn.setStyleSheet(PRIMARY_BTN_QSS)
+            self._pre_run_btn.clicked.connect(self._pre_run_clicked)
+            brow.addWidget(self._pre_run_btn)
+            self._pre_assess_btn = QPushButton("仅评估")
+            self._pre_assess_btn.clicked.connect(self._pre_assess_only)
+            brow.addWidget(self._pre_assess_btn)
+            self._pre_predict_btn = QPushButton("仅预标注")
+            self._pre_predict_btn.clicked.connect(self._pre_predict_only)
+            brow.addWidget(self._pre_predict_btn)
+            self._pre_cancel_btn = QPushButton("取消")
+            self._pre_cancel_btn.setEnabled(False)
+            self._pre_cancel_btn.clicked.connect(self._pre_cancel)
+            brow.addWidget(self._pre_cancel_btn)
+            brow.addStretch()
+            layout.addLayout(brow)
+            layout.addStretch()
+            return scroll
+
+        # ---- 预标注：状态与联动 ----
+        def _pre_controls(self) -> list:
+            return [self._pre_project, self._pre_check_btn, self._pre_weights,
+                    self._pre_weights_btn, self._pre_imgsz, self._pre_epochs,
+                    self._pre_freeze, self._pre_device, self._pre_model,
+                    self._pre_model_btn, self._pre_conf, self._pre_iou,
+                    self._pre_skip, self._pre_overwrite]
+
+        def _pre_update_connection(self):
+            ok = self.client is not None
+            self._pre_conn_hint.setVisible(not ok)
+            self._pre_apply_enabled()
+
+        def _pre_apply_enabled(self):
+            enabled = self.client is not None and not self._pre_running
+            for widget in self._pre_controls():
+                widget.setEnabled(enabled)
+            self._pre_run_btn.setEnabled(enabled)
+            self._pre_assess_btn.setEnabled(enabled)
+            self._pre_predict_btn.setEnabled(enabled)
+            self._pre_cancel_btn.setEnabled(self._pre_running)
+            self._pre_run_btn.setText("运行中…" if self._pre_running else "评估并预标注")
+
+        def _pre_set_running(self, running: bool):
+            self._pre_running = running
+            self._pre_apply_enabled()
+
+        def _pre_on_project_changed(self, _value):
+            if self._pre_running:
+                return
+            _set_status(self._pre_verdict, "未评估", "idle")
+            _set_status(self._pre_summary, "—", "idle")
+            _set_status(self._pre_tag, "版本标签: —", "idle")
+            self._pre_detail_table.setRowCount(0)
+
+        def _pre_toggle_detail(self, checked: bool):
+            self._pre_detail_table.setVisible(checked)
+            self._pre_detail_btn.setText("收起明细 ▾" if checked else "查看明细 ▸")
+
+        def _pre_chip(self, index: int, state: str):
+            mark = {"idle": "○", "run": "◐", "ok": "●", "err": "✕"}[state]
+            level = {"idle": "idle", "run": "warn", "ok": "ok", "err": "err"}[state]
+            _set_status(self._pre_chips[index],
+                        f"{mark} {self._PRE_STAGES[index]}", level)
+
+        def _pre_reset_chips(self):
+            for i in range(len(self._pre_chips)):
+                self._pre_chip(i, "idle")
+
+        def _pre_show_assessment(self, data: dict):
+            verdict = data.get("verdict", "")
+            text = {"ready": "● 可训练", "marginal": "◐ 勉强可训练",
+                    "insufficient": "✕ 数据不足"}.get(verdict, verdict)
+            level = {"ready": "ok", "marginal": "warn"}.get(verdict, "err")
+            _set_status(self._pre_verdict, text, level)
+
+            per_class = data.get("per_class") or {}
+            covered = sum(1 for v in per_class.values() if v > 0)
+            summary = (f"{data.get('labeled_tasks', 0)} 张 · "
+                       f"{data.get('instances', 0)} 个框 · "
+                       f"{covered}/{len(per_class)} 类 · "
+                       f"小目标 {float(data.get('small_ratio', 0)) * 100:.0f}% · "
+                       f"无效框 {data.get('invalid_boxes', 0)}")
+            _set_status(self._pre_summary, summary, level)
+
+            checks = data.get("checks") or []
+            table = self._pre_detail_table
+            table.setRowCount(len(checks))
+            marks = {"pass": "● 通过", "warn": "◐ 警告", "fail": "✕ 失败"}
+            for i, check in enumerate(checks):
+                table.setItem(i, 0, QTableWidgetItem(str(check.get("item", ""))))
+                table.setItem(i, 1, QTableWidgetItem(str(check.get("require", ""))))
+                table.setItem(i, 2, QTableWidgetItem(str(check.get("actual", ""))))
+                table.setItem(i, 3, QTableWidgetItem(
+                    marks.get(check.get("level"), str(check.get("level", "")))))
+
+            suggestion = data.get("suggestion")
+            if suggestion:
+                _set_status(self._pre_status, suggestion,
+                            "warn" if verdict == "marginal" else "err")
+
+        def _pre_refresh_models(self):
+            try:
+                from prelabel import RUN_ROOT
+            except Exception:
+                return
+            current = self._pre_model.currentData()
+            self._pre_model.blockSignals(True)
+            self._pre_model.clear()
+            self._pre_model.addItem("自动：最新 ONNX", "")
+            for path in sorted(RUN_ROOT.glob("*/model/*.onnx")):
+                self._pre_model.addItem(
+                    f"{path.parent.parent.name} · {path.name}", str(path))
+            if current:
+                idx = self._pre_model.findData(current)
+                if idx >= 0:
+                    self._pre_model.setCurrentIndex(idx)
+            self._pre_model.blockSignals(False)
+
+        # ---- 预标注：运行入口 ----
+        def _pre_assess_only(self):
+            if not self._ls_require_client():
+                return
+            self._pre_pending_pipeline = False
+            self._pre_start_worker(self._pre_make_assess_fn(), "assess")
+
+        def _pre_run_clicked(self):
+            if not self._ls_require_client():
+                return
+            self._pre_pending_pipeline = True
+            self._pre_start_worker(self._pre_make_assess_fn(), "assess")
+
+        def _pre_make_assess_fn(self):
+            project_id = self._pre_project.value()
+
+            def fn(log, on_event):
+                from prelabel import assess_project
+                return assess_project(project_id, client=self.client,
+                                      log=log).to_dict()
+            return fn
+
+        def _pre_device_value(self) -> str:
+            return ["auto", "cpu", "0"][self._pre_device.currentIndex()]
+
+        def _pre_start_pipeline(self):
+            project_id = self._pre_project.value()
+            weights = self._pre_weights.text().strip() or "weights/yolo26n.pt"
+            epochs = self._pre_epochs.value()
+            imgsz = self._pre_imgsz.value()
+            conf = self._pre_conf.value()
+            iou = self._pre_iou.value()
+            freeze = self._pre_freeze.value()
+            device = self._pre_device_value()
+
+            def fn(log, on_event):
+                from prelabel import run_pipeline
+                return run_pipeline(
+                    project_id, base_weights=weights, epochs=epochs,
+                    imgsz=imgsz, conf=conf, iou=iou, freeze=freeze,
+                    device=device, on_event=on_event,
+                    should_stop=self._pre_label_cancel.is_set, log=log)
+
+            self._pre_start_worker(fn, "pipeline")
+
+        def _pre_predict_only(self):
+            if not self._ls_require_client():
+                return
+            project_id = self._pre_project.value()
+            imgsz = self._pre_imgsz.value()
+            conf = self._pre_conf.value()
+            iou = self._pre_iou.value()
+            model = self._pre_model.currentData()
+            if not model:
+                try:
+                    from prelabel import RUN_ROOT
+                    models = sorted(RUN_ROOT.glob("*/model/*.onnx"))
+                except Exception:
+                    models = []
+                if not models:
+                    QMessageBox.warning(self, "提示", "没有可用的 ONNX 模型，请先训练。")
+                    return
+                model = str(models[-1])
+
+            def fn(log, on_event):
+                from prelabel import prelabel_project, tag_from_manifest, make_tag
+                tag = tag_from_manifest(model, imgsz) or make_tag("manual", imgsz)
+                return prelabel_project(
+                    project_id, model=model, tag=tag, conf=conf, iou=iou,
+                    imgsz=imgsz, skip=not self._pre_overwrite.isChecked(),
+                    overwrite=self._pre_overwrite.isChecked(),
+                    device=self._pre_device_value(), on_event=on_event,
+                    should_stop=self._pre_label_cancel.is_set,
+                    client=self.client, log=log).to_dict()
+
+            self._pre_start_worker(fn, "predict")
+
+        def _pre_start_worker(self, fn, mode: str):
+            self._pre_mode = mode
+            self._pre_label_cancel.clear()
+            self._pre_reset_chips()
+            self._pre_current_stage = None
+            self._pre_set_running(True)
+            self._show_progress(True)
+
+            worker = PrelabelWorker(fn)
+            worker.log_line.connect(self._log_append)
+            worker.event.connect(self._pre_on_event)
+            worker.finished.connect(self._pre_on_finished)
+            worker.error.connect(self._pre_on_error)
+            worker.finished.connect(lambda _: self._pre_worker_done(worker))
+            worker.error.connect(lambda _: self._pre_worker_done(worker))
+            self._pre_worker = worker
+            self._workers.append(worker)
+            worker.start()
+
+        def _pre_worker_done(self, worker):
+            # 只有当前 worker 结束时才复位状态；否则会误伤刚启动的下一阶段。
+            if self._pre_worker is worker:
+                self._show_progress(False)
+                self._pre_set_running(False)
+                self._pre_worker = None
+            worker.deleteLater()
+            if worker in self._workers:
+                self._workers.remove(worker)
+
+        def _pre_cancel(self):
+            self._pre_label_cancel.set()
+            _set_status(self._pre_status, "正在取消…（当前步骤结束后停止）", "warn")
+            self._pre_cancel_btn.setEnabled(False)
+
+        # ---- 预标注：事件与结果 ----
+        def _pre_on_event(self, event):
+            stage = getattr(event, "stage", "")
+            status = getattr(event, "status", "")
+            message = getattr(event, "message", "")
+            fraction = getattr(event, "fraction", None)
+            visible = getattr(event, "visible", True)
+
+            if stage in self._PRE_STAGE_KEYS:
+                idx = self._PRE_STAGE_KEYS.index(stage)
+                if status == "start":
+                    self._pre_current_stage = stage
+                    self._pre_chip(idx, "run")
+                elif status == "done":
+                    self._pre_chip(idx, "ok")
+                elif status == "error":
+                    self._pre_chip(idx, "err")
+
+            if message and visible:
+                self._log_append(message)
+                _set_status(self._pre_status, message, "warn")
+
+            if fraction is not None:
+                self._progress.setVisible(True)
+                self._progress.setRange(0, 100)
+                self._progress.setValue(max(0, min(100, int(fraction * 100))))
+            if status in ("done", "error"):
+                self._progress.setVisible(False)
+
+        def _pre_on_finished(self, report):
+            if self._pre_mode == "assess":
+                data = report
+                if data:
+                    self._pre_show_assessment(data)
+                    _set_status(self._pre_status,
+                                f"评估完成：{data.get('verdict', '')}", "ok")
+                if self._pre_pending_pipeline:
+                    self._pre_pending_pipeline = False
+                    verdict = (data or {}).get("verdict")
+                    if verdict == "insufficient":
+                        QMessageBox.warning(
+                            self, "数据不足",
+                            (data or {}).get("suggestion") or "请先补充标注。")
+                        return
+                    if verdict == "marginal":
+                        ans = QMessageBox.question(
+                            self, "数据偏少",
+                            ((data or {}).get("suggestion") or "数据偏少") +
+                            "\n\n仍要继续训练并预标注吗？",
+                            QMessageBox.Yes | QMessageBox.No)
+                        if ans != QMessageBox.Yes:
+                            return
+                    self._pre_start_pipeline()
+                return
+
+            report = report or {}
+            if self._pre_mode == "pipeline":
+                data = report.get("assessment")
+                if data:
+                    self._pre_show_assessment(data)
+                dataset = report.get("dataset")
+                if dataset:
+                    _set_status(
+                        self._pre_summary,
+                        f"{dataset.get('labeled_tasks', 0)} 张 · "
+                        f"{dataset.get('instances', 0)} 个框 · "
+                        f"train {dataset.get('train', 0)} / "
+                        f"val {dataset.get('val', 0)}", "ok")
+                train = report.get("train") or {}
+                if train:
+                    self._pre_last_run_dir = train.get("run_dir")
+                    metrics = train.get("metrics") or {}
+                    _set_status(
+                        self._pre_artifact,
+                        f"上次产物: {Path(str(train.get('run_dir', ''))).name} · "
+                        f"mAP50 {metrics.get('mAP50', 0):.2f}", "ok")
+                manifest = report.get("manifest") or {}
+                if manifest.get("tag"):
+                    _set_status(self._pre_tag,
+                                f"版本标签: {manifest['tag']}", "ok")
+                self._pre_show_prelabel_stats(report.get("prelabel"))
+                self._pre_refresh_models()
+                lines = ["流水线完成。"]
+                if train:
+                    metrics = train.get("metrics") or {}
+                    lines.append(f"mAP50: {metrics.get('mAP50', 0):.2f}")
+                stats = report.get("prelabel") or {}
+                lines.append(f"预标注: 写入 {stats.get('written', 0)} 张 / "
+                             f"失败 {stats.get('failed', 0)} 张 / "
+                             f"框 {stats.get('boxes', 0)}")
+                QMessageBox.information(self, "完成", "\n".join(lines))
+
+            elif self._pre_mode == "predict":
+                self._pre_show_prelabel_stats(report)
+                self._pre_refresh_models()
+
+        def _pre_show_prelabel_stats(self, stats):
+            if not stats:
+                return
+            written = stats.get("written", 0)
+            failed = stats.get("failed", 0)
+            skipped = stats.get("skipped", 0)
+            _set_status(
+                self._pre_review,
+                f"待复核 {written} 张 · 失败 {failed} 张 · 跳过 {skipped} 张",
+                "warn" if failed else "ok")
+            _set_status(
+                self._pre_status,
+                f"预标注完成：写入 {written} 张 / 失败 {failed} 张", "ok")
+
+        def _pre_on_error(self, message: str):
+            self._pre_pending_pipeline = False
+            if "已取消" in str(message):
+                _set_status(self._pre_status, "已取消", "idle")
+                self._log_append("⏹ 已取消")
+                self._pre_reset_chips()
+                return
+            self._log_append(f"❌ {message}")
+            _set_status(self._pre_status, f"失败：{message}", "err")
+            if self._pre_current_stage in self._PRE_STAGE_KEYS:
+                idx = self._PRE_STAGE_KEYS.index(self._pre_current_stage)
+                self._pre_chip(idx, "err")
+            QMessageBox.critical(self, "预标注失败", str(message))
+
+        # ---- 预标注：辅助操作 ----
+        def _pre_choose_model(self):
+            path, _ = QFileDialog.getOpenFileName(
+                self, "选择 ONNX 模型", "", "ONNX (*.onnx)")
+            if path:
+                self._pre_model.addItem(f"手动: {os.path.basename(path)}", path)
+                self._pre_model.setCurrentIndex(self._pre_model.count() - 1)
+
+        def _pre_open_ls(self):
+            if self.client is not None:
+                webbrowser.open(self.client.base_url)
+
+        def _pre_open_dir(self):
+            path = self._pre_last_run_dir
+            if not path:
+                try:
+                    from prelabel import RUN_ROOT
+                except Exception:
+                    return
+                dirs = sorted(RUN_ROOT.glob("*/")) if RUN_ROOT.exists() else []
+                if not dirs:
+                    return
+                path = str(dirs[-1])
+            if not os.path.isdir(str(path)):
+                return
+            import subprocess
+            if os.name == "nt":
+                os.startfile(str(path))  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(path)])
+            else:
+                subprocess.Popen(["xdg-open", str(path)])
+
+        def _pre_export_sample(self):
+            if not self._ls_require_client():
+                return
+            path, _ = QFileDialog.getSaveFileName(
+                self, "导出复核抽样", "prelabel_sample.csv", "CSV (*.csv)")
+            if not path:
+                return
+            project_id = self._pre_project.value()
+
+            def do_export():
+                import csv
+                from label_studio_data import list_tasks
+                tasks = list_tasks(project_id, page=1, page_size=1000,
+                                   client=self.client)
+                by_task: dict[int, list] = {}
+                for pred in self.client.predictions.list(project=project_id):
+                    version = getattr(pred, "model_version", "") or ""
+                    if version and not str(version).startswith("ctts-prelabel:"):
+                        continue
+                    task_id = getattr(pred, "task", None)
+                    if task_id is not None:
+                        by_task.setdefault(int(task_id), []).append(pred)
+
+                with open(path, "w", newline="", encoding="utf-8-sig") as fh:
+                    writer = csv.writer(fh)
+                    writer.writerow(["task_id", "image", "is_labeled",
+                                     "pred_boxes", "max_score"])
+                    for task in tasks:
+                        preds = by_task.get(int(task["id"]), [])
+                        boxes = sum(len(getattr(p, "result", []) or [])
+                                    for p in preds)
+                        scores = [float(getattr(p, "score", 0) or 0)
+                                  for p in preds]
+                        writer.writerow([
+                            task["id"],
+                            str((task.get("data") or {}).get("image", ""))[:300],
+                            "yes" if task.get("is_labeled") else "no",
+                            boxes,
+                            f"{max(scores):.3f}" if scores else "",
+                        ])
+                return len(tasks)
+
+            self._run_task(
+                do_export,
+                lambda n: QMessageBox.information(
+                    self, "导出完成", f"已导出 {n} 条任务到\n{path}"),
+                "导出抽样")
 
         # ============================================================
         # 训练 Tab
@@ -930,6 +1739,13 @@ def gui_main():
             self._progress.setVisible(show)
             if show:
                 self._progress.setRange(0, 0)  # indeterminate
+            else:
+                self._progress.setRange(0, 0)
+
+        def _set_progress(self, done: int, total: int):
+            self._progress.setVisible(True)
+            self._progress.setRange(0, max(total, 1))
+            self._progress.setValue(done)
 
         def _log_append(self, msg: str):
             self._log_output.append(msg.rstrip())
@@ -961,20 +1777,41 @@ def gui_main():
             self._workers.append(worker)
             worker.start()
 
-        def _run_task(self, fn, callback, desc="处理中"):
-            """启动后台任务（无日志流，仅进度条 + 结果回调）。"""
-            self._show_progress(True)
+        def _run_task(self, fn, callback, desc="处理中", *,
+                      show_progress=True, quiet_errors=False, on_settle=None,
+                      on_error=None):
+            """启动后台任务（无日志流，仅进度条 + 结果回调）。
+
+            quiet_errors=True 时不弹错误框、不写日志，适合后台静默刷新。
+            on_settle 在成功/失败后都会调用，用于复位按钮等状态。
+            """
+            if show_progress:
+                self._show_progress(True)
+
             # 包装为兼容 StreamWorker 的 fn_with_log 形式
             def wrapper(log):
                 return fn()
+
+            def settle():
+                if show_progress:
+                    self._show_progress(False)
+                if on_settle is not None:
+                    on_settle()
+
+            def handle_error(e):
+                if not quiet_errors:
+                    self._log_append(f"❌ {desc}错误: {e}")
+                    QMessageBox.critical(self, "错误", str(e))
+                if on_error is not None:
+                    on_error(e)
+                settle()
+
             worker = StreamWorker(wrapper)
             worker.finished.connect(callback)
-            worker.finished.connect(lambda _: self._show_progress(False))
+            worker.finished.connect(lambda _: settle())
             worker.finished.connect(lambda _: (worker.deleteLater(),
                 self._workers.remove(worker) if worker in self._workers else None))
-            worker.error.connect(lambda e: (
-                self._log_append(f"❌ {desc}错误: {e}"), self._show_progress(False),
-                QMessageBox.critical(self, "错误", str(e))))
+            worker.error.connect(handle_error)
             worker.error.connect(lambda _: (worker.deleteLater(),
                 self._workers.remove(worker) if worker in self._workers else None))
             self._workers.append(worker)

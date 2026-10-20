@@ -264,6 +264,10 @@ class LabelStudioClient:
         """复用 SDK 的认证头（自动处理旧版 Token / JWT）。"""
         return self.sdk._client_wrapper.get_headers()
 
+    def auth_headers(self) -> dict[str, str]:
+        """公开的认证头（供预标注下载同源图片使用）。"""
+        return self._headers()
+
     def whoami(self) -> dict:
         """当前登录用户信息。"""
         return to_dict(self.sdk.users.whoami())
