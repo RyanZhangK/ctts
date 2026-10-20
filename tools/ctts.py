@@ -163,7 +163,7 @@ def gui_main():
         sys.path.insert(0, tools_dir)
 
     try:
-        from PySide6.QtCore import Qt, QThread, Signal
+        from PySide6.QtCore import Qt, QThread, QTimer, Signal
         from PySide6.QtGui import QFont
         from PySide6.QtWidgets import (
             QApplication, QWidget, QVBoxLayout, QHBoxLayout,
@@ -257,6 +257,7 @@ def gui_main():
     # ---- StreamWorker ----
     class StreamWorker(QThread):
         log_line = Signal(str)
+        progress = Signal(int, int)
         finished = Signal(object)
         error = Signal(str)
 
@@ -305,6 +306,7 @@ def gui_main():
             layout.addWidget(self._progress)
 
             tabs = QTabWidget()
+            self._tabs = tabs
             tabs.addTab(self._build_data_tab(), "① 数据准备")
             tabs.addTab(self._build_label_tab(), "② 标注管理")
             tabs.addTab(self._build_prelabel_tab(), "③ 预标注")
@@ -535,9 +537,9 @@ def gui_main():
             grp_proj = QGroupBox("项目列表")
             pl = QVBoxLayout(grp_proj)
             btn_row = QHBoxLayout()
-            btn_refresh = QPushButton("刷新")
-            btn_refresh.clicked.connect(self._ls_refresh_projects)
-            btn_row.addWidget(btn_refresh)
+            self._ls_refresh_btn = QPushButton("刷新")
+            self._ls_refresh_btn.clicked.connect(self._ls_refresh_projects)
+            btn_row.addWidget(self._ls_refresh_btn)
             btn_create = QPushButton("新建项目")
             btn_create.clicked.connect(self._ls_create_project)
             btn_row.addWidget(btn_create)
@@ -546,12 +548,24 @@ def gui_main():
             btn_del.clicked.connect(self._ls_delete_project)
             btn_row.addWidget(btn_del)
             btn_row.addStretch()
+            self._ls_auto_cb = QCheckBox("自动刷新")
+            self._ls_auto_cb.setChecked(True)
+            self._ls_auto_cb.setToolTip("停留在本页时每 15 秒静默刷新项目状态")
+            self._ls_auto_cb.toggled.connect(self._ls_toggle_auto)
+            btn_row.addWidget(self._ls_auto_cb)
+            self._ls_last_refresh = QLabel("尚未刷新")
+            _set_status(self._ls_last_refresh, "尚未刷新", "idle")
+            btn_row.addWidget(self._ls_last_refresh)
             pl.addLayout(btn_row)
 
             self._ls_project_table = QTableWidget()
-            self._ls_project_table.setColumnCount(3)
-            self._ls_project_table.setHorizontalHeaderLabels(["ID", "标题", "任务数"])
+            self._ls_project_table.setColumnCount(5)
+            self._ls_project_table.setHorizontalHeaderLabels(
+                ["ID", "标题", "任务数", "已标注", "进度"])
             self._ls_project_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+            for col in (0, 2, 3, 4):
+                self._ls_project_table.horizontalHeader().setSectionResizeMode(
+                    col, QHeaderView.ResizeToContents)
             self._ls_project_table.setSelectionBehavior(QTableWidget.SelectRows)
             self._ls_project_table.setEditTriggers(QTableWidget.NoEditTriggers)
             self._ls_project_table.itemSelectionChanged.connect(self._ls_on_project_selected)
@@ -604,16 +618,23 @@ def gui_main():
             btn_folder = QPushButton("选择文件夹...")
             btn_folder.clicked.connect(self._ls_select_folder)
             up_row.addWidget(btn_folder)
-            btn_upload = QPushButton("上传")
-            btn_upload.setStyleSheet("font-weight: bold;")
-            btn_upload.clicked.connect(self._ls_upload_images)
-            up_row.addWidget(btn_upload)
+            self._ls_upload_btn = QPushButton("上传")
+            self._ls_upload_btn.setStyleSheet(PRIMARY_BTN_QSS)
+            self._ls_upload_btn.clicked.connect(self._ls_upload_images)
+            up_row.addWidget(self._ls_upload_btn)
             up_row.addStretch()
             ul.addLayout(up_row)
             self._ls_upload_info = QLabel("未选择文件")
             _set_status(self._ls_upload_info, "未选择文件", "idle")
             ul.addWidget(self._ls_upload_info)
             layout.addWidget(grp_upload)
+
+            # 自动刷新：连接成功且停留在 ② 页签时，每 15s 静默刷新项目状态
+            self._ls_connected_ok = False
+            self._ls_auto_busy = False
+            self._ls_timer = QTimer(self)
+            self._ls_timer.setInterval(15000)
+            self._ls_timer.timeout.connect(self._ls_auto_tick)
 
             # 已自动连上则刷新；否则等用户点「连接 / 重连」
             if self.client is not None:
@@ -631,12 +652,16 @@ def gui_main():
                 self.client.whoami()
                 _set_status(self._ls_conn_status,
                             f"已连接: {self.client.base_url}", "ok")
+                self._ls_connected_ok = True
+                self._ls_timer.start()
                 self._ls_refresh_projects()
                 # 连接状态同步到 ③ 预标注（否则仍显示“请先连接”）
                 self._pre_refresh_models()
                 self._pre_update_connection()
             except Exception as e:
                 self.client = None
+                self._ls_connected_ok = False
+                self._ls_timer.stop()
                 _set_status(self._ls_conn_status, f"连接失败: {e}", "err")
                 self._pre_update_connection()
                 QMessageBox.warning(self, "连接失败", str(e))
@@ -647,21 +672,90 @@ def gui_main():
                 return False
             return True
 
-        def _ls_refresh_projects(self):
+        def _ls_refresh_projects(self, quiet: bool = False):
             if not self._ls_require_client():
                 return
+            if self._ls_auto_busy:
+                return
+            self._ls_auto_busy = True
+            self._ls_refresh_btn.setEnabled(False)
+            if not quiet:
+                _set_status(self._ls_last_refresh, "刷新中…", "warn")
+            selected = self._ls_selected_project_id()
+
+            def settle():
+                self._ls_auto_busy = False
+                self._ls_refresh_btn.setEnabled(True)
+
             self._run_task(
                 lambda: list_projects(self.client),
-                lambda ps: self._ls_populate_projects(ps),
+                lambda ps: self._ls_populate_projects(ps, selected),
                 "加载项目",
+                show_progress=not quiet,
+                quiet_errors=quiet,
+                on_settle=settle,
+                on_error=lambda e: _set_status(
+                    self._ls_last_refresh, "刷新失败", "err"),
             )
 
-        def _ls_populate_projects(self, projects):
-            self._ls_project_table.setRowCount(len(projects))
+        def _ls_selected_project_id(self):
+            rows = self._ls_project_table.selectionModel().selectedRows()
+            if not rows:
+                return None
+            item = self._ls_project_table.item(rows[0].row(), 0)
+            return int(item.text()) if item else None
+
+        def _ls_populate_projects(self, projects, select_id=None):
+            self._ls_connected_ok = True
+            table = self._ls_project_table
+            table.blockSignals(True)
+            table.setRowCount(len(projects))
             for i, p in enumerate(projects):
-                self._ls_project_table.setItem(i, 0, QTableWidgetItem(str(p["id"])))
-                self._ls_project_table.setItem(i, 1, QTableWidgetItem(p.get("title", "")))
-                self._ls_project_table.setItem(i, 2, QTableWidgetItem(str(p.get("task_number", 0))))
+                pid = p["id"]
+                total = p.get("task_number") or 0
+                labeled = p.get("num_tasks_with_annotations") or 0
+                pct = f"{labeled / total * 100:.0f}%" if total else "—"
+                table.setItem(i, 0, QTableWidgetItem(str(pid)))
+                table.setItem(i, 1, QTableWidgetItem(p.get("title", "")))
+                table.setItem(i, 2, QTableWidgetItem(str(total)))
+                table.setItem(i, 3, QTableWidgetItem(str(labeled)))
+                item = QTableWidgetItem(pct)
+                item.setToolTip(f"{labeled} / {total}")
+                table.setItem(i, 4, item)
+            table.blockSignals(False)
+            table.clearSelection()
+            if select_id is not None:
+                # 静默恢复选中行：不触发 selectionChanged，避免自动刷新覆盖
+                # 用户手动输入的任务/上传项目 ID。
+                table.blockSignals(True)
+                for row in range(table.rowCount()):
+                    if table.item(row, 0).text() == str(select_id):
+                        table.selectRow(row)
+                        break
+                table.blockSignals(False)
+            if self._ls_auto_cb.isChecked() and not self._ls_timer.isActive():
+                self._ls_timer.start()
+            from datetime import datetime as _dt
+            _set_status(self._ls_last_refresh,
+                        f"最后刷新 {_dt.now():%H:%M:%S}", "ok")
+
+        def _ls_toggle_auto(self, enabled: bool):
+            if enabled and self._ls_connected_ok:
+                self._ls_timer.start()
+                self._ls_auto_tick()
+            elif not enabled:
+                self._ls_timer.stop()
+
+        def _ls_auto_tick(self):
+            if not self._ls_auto_cb.isChecked():
+                return
+            if not self._ls_connected_ok or self.client is None:
+                return
+            if self._ls_auto_busy or self._workers:
+                return
+            if getattr(self, "_tabs", None) is not None and self._tabs.currentIndex() != 1:
+                return
+            self._ls_refresh_projects(quiet=True)
 
         def _ls_on_project_selected(self):
             """项目列表选中行时，自动同步项目 ID 到任务管理和上传区域。"""
@@ -805,8 +899,15 @@ def gui_main():
             if ans != QMessageBox.Yes:
                 return
 
-            def do_upload():
-                return import_tasks_from_images(pid, paths, client=self.client)
+            total = len(paths)
+            holder = {}
+
+            def do_upload(log):
+                return import_tasks_from_images(
+                    pid, paths, client=self.client,
+                    progress=lambda done, n: holder["w"].progress.emit(done, n),
+                    log=log,
+                )
 
             def on_done(result):
                 n = result.get("task_count", 0)
@@ -814,18 +915,51 @@ def gui_main():
                 if errs:
                     detail = "\n".join(errs[:10])
                     more = f"\n... 还有 {len(errs) - 10} 个错误" if len(errs) > 10 else ""
+                    _set_status(self._ls_upload_info,
+                                f"上传完成 {n}/{total}，失败 {len(errs)}", "err")
                     QMessageBox.warning(self, "上传完成（有错误）",
                         f"成功 {n} 个，失败 {len(errs)} 个\n\n失败详情:\n{detail}{more}")
                 else:
+                    _set_status(self._ls_upload_info,
+                                f"上传完成 {n}/{total}（项目 {pid}）", "ok")
                     QMessageBox.information(self, "上传完成",
                         f"已导入 {n} 个任务到项目 {pid}")
                 self._ls_image_paths = []
-                _set_status(self._ls_upload_info, "未选择文件", "idle")
-                # 刷新任务列表
+                self._ls_upload_btn.setEnabled(True)
+                # 上传后自动刷新：项目计数 + 当前任务列表，不再依赖手动刷新
+                self._ls_refresh_projects(quiet=True)
                 if self._ls_task_project.value() == pid:
                     self._ls_load_tasks()
 
-            self._run_task(do_upload, on_done, "上传图片")
+            def on_fail(message):
+                self._ls_upload_btn.setEnabled(True)
+                _set_status(self._ls_upload_info, f"上传失败: {message}", "err")
+
+            self._show_progress(True)
+            self._progress.setRange(0, max(total, 1))
+            self._progress.setValue(0)
+            self._ls_upload_btn.setEnabled(False)
+            worker = StreamWorker(do_upload)
+            holder["w"] = worker
+            worker.progress.connect(
+                lambda done, n: self._ls_upload_progress(done, n, pid))
+            worker.finished.connect(on_done)
+            worker.finished.connect(lambda _: self._show_progress(False))
+            worker.finished.connect(lambda _: (worker.deleteLater(),
+                self._workers.remove(worker) if worker in self._workers else None))
+            worker.error.connect(on_fail)
+            worker.error.connect(lambda e: (
+                QMessageBox.critical(self, "上传失败", str(e)),
+                self._show_progress(False)))
+            worker.error.connect(lambda _: (worker.deleteLater(),
+                self._workers.remove(worker) if worker in self._workers else None))
+            self._workers.append(worker)
+            worker.start()
+
+        def _ls_upload_progress(self, done: int, total: int, pid: int):
+            self._set_progress(done, total)
+            _set_status(self._ls_upload_info,
+                        f"上传中 {done}/{total} → 项目 {pid}", "warn")
 
         # ============================================================
         # ③ 预标注 Tab
@@ -1605,6 +1739,13 @@ def gui_main():
             self._progress.setVisible(show)
             if show:
                 self._progress.setRange(0, 0)  # indeterminate
+            else:
+                self._progress.setRange(0, 0)
+
+        def _set_progress(self, done: int, total: int):
+            self._progress.setVisible(True)
+            self._progress.setRange(0, max(total, 1))
+            self._progress.setValue(done)
 
         def _log_append(self, msg: str):
             self._log_output.append(msg.rstrip())
@@ -1636,20 +1777,41 @@ def gui_main():
             self._workers.append(worker)
             worker.start()
 
-        def _run_task(self, fn, callback, desc="处理中"):
-            """启动后台任务（无日志流，仅进度条 + 结果回调）。"""
-            self._show_progress(True)
+        def _run_task(self, fn, callback, desc="处理中", *,
+                      show_progress=True, quiet_errors=False, on_settle=None,
+                      on_error=None):
+            """启动后台任务（无日志流，仅进度条 + 结果回调）。
+
+            quiet_errors=True 时不弹错误框、不写日志，适合后台静默刷新。
+            on_settle 在成功/失败后都会调用，用于复位按钮等状态。
+            """
+            if show_progress:
+                self._show_progress(True)
+
             # 包装为兼容 StreamWorker 的 fn_with_log 形式
             def wrapper(log):
                 return fn()
+
+            def settle():
+                if show_progress:
+                    self._show_progress(False)
+                if on_settle is not None:
+                    on_settle()
+
+            def handle_error(e):
+                if not quiet_errors:
+                    self._log_append(f"❌ {desc}错误: {e}")
+                    QMessageBox.critical(self, "错误", str(e))
+                if on_error is not None:
+                    on_error(e)
+                settle()
+
             worker = StreamWorker(wrapper)
             worker.finished.connect(callback)
-            worker.finished.connect(lambda _: self._show_progress(False))
+            worker.finished.connect(lambda _: settle())
             worker.finished.connect(lambda _: (worker.deleteLater(),
                 self._workers.remove(worker) if worker in self._workers else None))
-            worker.error.connect(lambda e: (
-                self._log_append(f"❌ {desc}错误: {e}"), self._show_progress(False),
-                QMessageBox.critical(self, "错误", str(e))))
+            worker.error.connect(handle_error)
             worker.error.connect(lambda _: (worker.deleteLater(),
                 self._workers.remove(worker) if worker in self._workers else None))
             self._workers.append(worker)

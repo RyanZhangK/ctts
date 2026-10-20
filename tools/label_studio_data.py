@@ -13,6 +13,7 @@
 import argparse
 import json
 import os
+from typing import Callable
 import sys
 
 from label_studio_auth import (
@@ -88,11 +89,16 @@ def import_tasks_from_images(
     project_id: int,
     image_paths: list[str],
     client=None,
+    progress: Callable[[int, int], None] | None = None,
+    log: Callable[[str], None] | None = None,
 ) -> dict:
     """批量导入本地图片作为标注任务。
 
     通过 SDK 客户端上传每张图片并创建任务。
     图片从调用方机器读取并上传到目标实例（本机或远程均可）。
+
+    progress(done, total) 每处理完一张回调一次，便于 GUI 显示进度；
+    log(msg) 用于逐条报告失败项。
     """
     c = client or get_client()
 
@@ -104,7 +110,15 @@ def import_tasks_from_images(
         try:
             c.upload_file(project_id, p)
         except Exception as e:
-            errors.append(f"[{i}/{total}] {filename}: {e}")
+            message = f"[{i}/{total}] {filename}: {e}"
+            errors.append(message)
+            if log:
+                log(f"上传失败 {message}")
+        if progress:
+            try:
+                progress(i, total)
+            except Exception:
+                pass
 
     result = {"task_count": total - len(errors)}
     if errors:
