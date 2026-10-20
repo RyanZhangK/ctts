@@ -1,14 +1,52 @@
 # CTTS — CNN Train Tools Set
 
-视觉 CNN 训练全流程工具集：数据准备 → 标注管理 → YOLO训练 → 推理验证。
+[![License: GPL-3.0](https://img.shields.io/badge/license-GPL--3.0-blue.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/python-3.13%2B-3776AB.svg)](https://www.python.org/)
+[![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey.svg)](#环境配置)
+
+视觉 CNN 训练全流程工具集：数据准备 → 标注管理 → 小模型预标注 → 训练 → 推理验证。
 
 ## 有什么用？
 
+目标检测最贵的一步是标注。CTTS 把「抽帧 → 质量过滤 → Label Studio 标注 → 小模型预标注 → 导出 → 训练 → 推理」串成一条可重复的流程，核心是：
+
+- **少标一点也能开始** — 默认只需 ≥50 张已标注图、≥100 个框，即可微调 YOLO nano 模型。
+- **预标注省人工** — nano 模型先给未标注任务画框，人工从「画框」变成「改框」。
+- **数据不离开 Label Studio** — 数据就绪度评估、微数据集构建、预测写回都走 LS API，不用手工搬文件。
+- **单机 / 内网都能用** — 本机 LS 零配置读取 Token；远程实例用 `--base-url` + `--token`。
+- **CLI 与 GUI 等价** — 批量任务走 CLI，日常操作走六页签 GUI，二者产物一致。
+
+实际能省多少标注取决于目标尺度、场景复杂度和类别数。建议先跑 `prelabel assess` 看数据是否就绪，再决定是否进入训练。
+
+## 工作流
+
+```text
+视频 / 图片
+   │  data build / data filter
+   ▼
+RawData ──► Label Studio 人工标注一小部分
+   │                          │
+   │                          ▼
+   │                prelabel assess（数据够不够？）
+   │                          │ 够
+   │                          ▼
+   │                建微数据集 → 训练 yolo26n → 导出 ONNX
+   │                          │
+   │                          ▼
+   │                写回 predictions（仅未标注任务）
+   │                          │
+   │                          ▼
+   │                人工复核并提交
+   ▼
+导出 YOLO → data split → train → detect
+```
 
 ## 项目结构
 
-```
+```text
 ctts/
+├── LICENSE                 # GPL-3.0
+├── README.md
 ├── tools/                  # 工具脚本
 │   ├── ctts.py            # ★ 统一入口（CLI + GUI）
 │   ├── dataset_build.py   # 视频抽帧 + 质量过滤
@@ -22,7 +60,7 @@ ctts/
 │   ├── label_studio_main.py     # LS CLI 入口
 │   ├── prelabel.py        # ★ 小模型预标注流水线
 │   ├── test_prelabel.py   # 预标注离线单测（无需 LS/GPU）
-│   ├── pyproject.toml     # uv 依赖声明
+│   ├── pyproject.toml     # 依赖声明
 │   └── .gitignore
 ├── docs/                  # 设计文档
 │   └── prelabel_design.md # 预标注功能设计
@@ -37,6 +75,13 @@ ctts/
 ```
 
 ## 快速开始
+
+### 获取代码
+
+```bash
+git clone git@github.com:RyanZhangK/ctts.git
+cd ctts
+```
 
 ### 环境配置
 
@@ -77,7 +122,7 @@ python ctts.py data split dataset/ -v 0.2              # 划分训练/验证集
 
 # 标注管理（需先启动 Label Studio）
 python ctts.py label project list                      # 列出项目
-python ctts.py label project create "新项目"           # 创建项目
+python ctts.py label project create "新项目" --labels stb
 python ctts.py label data stats -p 10                  # 标注进度
 python ctts.py label data list -p 10                   # 查看任务
 
@@ -104,20 +149,21 @@ python ctts.py --gui
 ```
 
 GUI 包含六个 Tab：
+
 - **📦 数据准备** — 视频抽帧、质量过滤、数据集划分
-- **🏷️ 标注管理** — Label Studio 项目与任务管理
+- **🏷️ 标注管理** — Label Studio 项目与任务管理；上传逐张显示进度，项目列表展示已标注数/进度并每 15s 自动刷新
 - **🎯 预标注** — 评估数据 → 训练小模型 → API 预标注 → 复核
 - **🗂️ 数据集划分** — 已标注数据划分为 train/val
 - **🚀 训练** — YOLO 训练参数配置与启动
 - **🔍 推理** — 实时检测窗口启动
 
-### 小模型预标注
+## 小模型预标注
 
 人工只标一小部分，用 nano 模型先标剩下的，再人工复核，可显著减少重复劳动。
 
 流程（一个 Tab 内完成，也可用 `ctts.py prelabel`）：
 
-1. **评估数据就绪度** — 通过 Label Studio API 统计已标注任务、实例数、类别覆盖；
+1. **评估数据就绪度** — 通过 Label Studio API 统计已标注任务、实例数、类别覆盖。
    默认门槛：≥50 张、≥100 框、每类 ≥30 框。达到一半（25/50/15）判为「勉强可训练」，
    会弹窗确认；不足则明确提示还差多少。
 2. **构建微数据集** — 只下载/匹配已标注图片，百分比坐标直接转 YOLO 归一化坐标，
@@ -136,10 +182,14 @@ GUI 包含六个 Tab：
 
 CTTS 通过 Label Studio API 管理标注项目。支持：
 
-- **零配置认证** — 自动从 Label Studio SQLite 数据库读取 Token  (其实不是很安全的说，鉴于LS的常见场景下都是本机运行所以选择性无视了)
-- **项目管理** — 创建/删除项目，预设目标检测和分类模板
-- **本地文件存储** — 直接指向图片目录，无需上传
-- **任务管理** — 浏览、删除、统计标注进度
+- **零配置认证** — 自动从本机 Label Studio SQLite 数据库读取 Token
+  （本机场景足够方便；共享机器上请改用 `--token` 或环境变量 `LABEL_STUDIO_TOKEN`）。
+- **远程实例** — `--base-url http://host:8080 --token <TOKEN>`，适用于内网/容器部署。
+- **项目管理** — 创建/删除项目，按类别生成目标检测 label config。
+- **本地文件存储** — 直接指向图片目录，无需上传。
+- **任务管理** — 浏览、删除、统计标注进度；GUI 上传逐张显示进度。
+- **状态自动刷新** — GUI 停留在「标注管理」时每 15s 静默刷新项目计数，
+  上传/创建/删除后立即刷新，无需手动点「刷新」。
 
 ### Label Studio 环境要求
 
@@ -170,9 +220,9 @@ python ctts.py data filter dataset/RawData/ --move
 python ctts.py label project storage-add 10 /home/ryanz/mydata/RawData
 python ctts.py label project storage-sync 1
 
-# 4. 在 Label Studio Web UI 完成人工标注
+# 4. 在 Label Studio Web UI 完成一小部分人工标注
 
-# 5. 小模型预标注（可选；数据达到 50 张 / 100 框后）
+# 5. 小模型预标注（数据达到 50 张 / 100 框后）
 python ctts.py prelabel run -p 10
 # → 回到 Label Studio 复核预测框并提交
 
@@ -194,12 +244,38 @@ python ctts.py detect --video test.mp4 -w weights/best.pt
 |----|------|
 | opencv-python | 视频/图像处理 |
 | numpy | 数值计算 |
+| httpx | 网络请求 |
 | ultralytics | YOLO 训练与推理 |
 | PySide6 | 图形界面 |
-| label-studio-sdk | Label Studio API（含 httpx） |
+| label-studio-sdk | Label Studio API |
 
-通过 `uv sync` 一键安装全部依赖。
+运行 `python setup_env.py` 一键安装全部依赖。
 
 ## 自定义训练参数
 
 编辑 `tools/yolo_train.py` 修改训练配置，或在 GUI 训练 Tab 中调整参数后启动。
+
+预标注流水线的训练超参（imgsz、epochs、freeze、device、conf/iou）在 GUI「预标注」Tab 中可调；
+CLI 子命令与参数见 `python prelabel.py --help`（`ctts.py prelabel ...` 会把参数原样转发）。
+
+## 贡献
+
+欢迎 Issue 和 Pull Request。提交前建议：
+
+```bash
+cd tools
+python -m unittest test_prelabel -q
+```
+
+单测不依赖 Label Studio 或 GPU；涉及 GUI 的改动请至少跑一次 `python ctts.py --gui` 手工验证。
+
+## 开源协议
+
+本项目采用 **GNU General Public License v3.0 only（GPL-3.0）** 发布，
+完整条款见 [LICENSE](LICENSE)。
+
+- 可以自由使用、修改、分发，包括商业用途；
+- 分发修改后的版本时，需同样以 GPL-3.0 开源并提供对应源代码；
+- 软件按「原样」提供，不附带任何担保。
+
+Copyright (C) 2026 RyanZ
