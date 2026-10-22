@@ -796,4 +796,6 @@ python ctts.py prelabel review -p 10 --tag ctts-prelabel:v1@480 --sample 0.1
 - [x] `label_studio_project.py`：从 classes.txt 生成检测模板
 - [x] 统一状态色常量，并同步 ② 页签
 - [x] README：新流程、命令、目录结构
+- [x] `tools/review.py` + `⑦ 复核` Tab：按批加载、逐任务勾选、框级子集、批量认可为 annotation
+- [x] `tools/test_review.py`（4 项离线单测）：扫描过滤/最新版本、部分框、跳过已标注、失败收集
 - [ ] 本机 E2E：30 张标注 → 训练 2 epoch → 预标注 → 复核（当前环境无 LS 服务/数据，未执行）

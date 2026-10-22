@@ -184,7 +184,7 @@ def gui_main():
             QGroupBox, QFormLayout, QSpinBox, QProgressBar,
             QMainWindow, QFileDialog, QTextEdit, QComboBox,
             QCheckBox, QDoubleSpinBox, QSlider, QScrollArea,
-            QPlainTextEdit,
+            QPlainTextEdit, QDialog, QDialogButtonBox,
         )
     except ModuleNotFoundError:
         venv_dir = os.path.expanduser(os.environ.get("CTTS_VENV", "~/.cache/ctts-venv"))
@@ -320,6 +320,7 @@ def gui_main():
             tabs.addTab(self._build_split_tab(), "④ 数据集划分")
             tabs.addTab(self._build_train_tab(), "⑤ 训练")
             tabs.addTab(self._build_detect_tab(), "⑥ 推理")
+            tabs.addTab(self._build_review_tab(), "⑦ 复核")
             layout.addWidget(tabs)
 
             # 共享日志输出
@@ -340,6 +341,8 @@ def gui_main():
         def _on_tab_changed(self, index: int):
             if index == 2:
                 self._pre_update_connection()
+            elif index == 6:
+                self._rv_auto_load()
 
         # ============================================================
         # ① 数据准备 Tab
@@ -661,6 +664,7 @@ def gui_main():
             _set_status(self._ls_conn_status,
                         "连接配置已修改，请点「连接 / 重连」", "warn")
             self._pre_update_connection()
+            self._rv_invalidate()
 
         def _ls_reconnect(self):
             """按界面上的地址 / Token 连接本机或远程 Label Studio。"""
@@ -679,6 +683,7 @@ def gui_main():
                 # 连接状态同步到 ③ 预标注（否则仍显示“请先连接”）
                 self._pre_refresh_models()
                 self._pre_update_connection()
+                self._rv_invalidate()
             except Exception as e:
                 self.client = None
                 self._ls_connected_ok = False
@@ -1803,6 +1808,405 @@ def gui_main():
                 stderr = proc.stderr.read().decode(errors="replace")
                 QMessageBox.critical(self, "推理启动失败",
                     f"detect.py 异常退出 (code={ret})\n\n{stderr[-500:]}")
+
+        # ============================================================
+        # ⑦ 预标注复核 Tab
+        # ============================================================
+        def _build_review_tab(self) -> QWidget:
+            w = QWidget()
+            layout = QVBoxLayout(w)
+
+            grp = QGroupBox("加载预标注结果")
+            fl = QFormLayout(grp)
+            row = QHBoxLayout()
+            self._rv_project = QSpinBox()
+            self._rv_project.setRange(0, 99999999)
+            self._rv_project.setPrefix("项目 ")
+            row.addWidget(self._rv_project)
+            self._rv_version = QComboBox()
+            self._rv_version.addItem("全部版本", "")
+            row.addWidget(QLabel("版本:"))
+            row.addWidget(self._rv_version)
+            self._rv_only_unlabeled = QCheckBox("仅未标注")
+            self._rv_only_unlabeled.setChecked(True)
+            row.addWidget(self._rv_only_unlabeled)
+            self._rv_batch_size = QSpinBox()
+            self._rv_batch_size.setRange(1, 200)
+            self._rv_batch_size.setValue(20)
+            self._rv_batch_size.setSuffix(" 条/批")
+            row.addWidget(QLabel("每批:"))
+            row.addWidget(self._rv_batch_size)
+            self._rv_load_btn = QPushButton("加载")
+            self._rv_load_btn.setStyleSheet(PRIMARY_BTN_QSS)
+            self._rv_load_btn.clicked.connect(self._rv_load)
+            row.addWidget(self._rv_load_btn)
+            row.addStretch()
+            fl.addRow(row)
+            self._rv_status = QLabel("未加载：先连接 ②，选择项目后点“加载”")
+            _set_status(self._rv_status, self._rv_status.text(), "idle")
+            fl.addRow(self._rv_status)
+            layout.addWidget(grp)
+
+            grp2 = QGroupBox("批次复核")
+            bl = QVBoxLayout(grp2)
+            bar = QHBoxLayout()
+            self._rv_batch_info = QLabel("—")
+            bar.addWidget(self._rv_batch_info)
+            bar.addStretch()
+            self._rv_prev = QPushButton("上一批")
+            self._rv_prev.clicked.connect(lambda: self._rv_page(-1))
+            self._rv_next = QPushButton("下一批")
+            self._rv_next.clicked.connect(lambda: self._rv_page(1))
+            bar.addWidget(self._rv_prev)
+            bar.addWidget(self._rv_next)
+            bl.addLayout(bar)
+
+            self._rv_table = QTableWidget(0, 5)
+            self._rv_table.setHorizontalHeaderLabels(["认可", "任务", "预测框", "版本", "状态"])
+            self._rv_table.verticalHeader().setVisible(False)
+            self._rv_table.setSelectionBehavior(QTableWidget.SelectRows)
+            self._rv_table.setEditTriggers(QTableWidget.NoEditTriggers)
+            self._rv_table.horizontalHeader().setStretchLastSection(True)
+            self._rv_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+            self._rv_table.itemChanged.connect(self._rv_item_changed)
+            bl.addWidget(self._rv_table)
+
+            ops = QHBoxLayout()
+            for text, slot in (("全选本批", self._rv_select_page),
+                               ("全不选", self._rv_select_none),
+                               ("调整选中框…", self._rv_adjust_boxes),
+                               ("在 LS 打开", self._rv_open_task)):
+                btn = QPushButton(text)
+                btn.clicked.connect(slot)
+                ops.addWidget(btn)
+            ops.addStretch()
+            self._rv_accept_btn = QPushButton("认可选中")
+            self._rv_accept_btn.setStyleSheet(PRIMARY_BTN_QSS)
+            self._rv_accept_btn.clicked.connect(self._rv_accept)
+            ops.addWidget(self._rv_accept_btn)
+            bl.addLayout(ops)
+            hint = QLabel("勾选任务后点“认可选中”；默认认可该任务全部预测框，"
+                          "可先用“调整选中框…”只保留部分框。")
+            hint.setStyleSheet(MUTED_QSS)
+            bl.addWidget(hint)
+            layout.addWidget(grp2)
+
+            # 状态
+            self._rv_items = []
+            self._rv_checked: set[int] = set()
+            self._rv_box_sel: dict[int, list[int]] = {}
+            self._rv_batch = 0
+            self._rv_loaded_project = -1
+            self._rv_busy = False
+
+            self._rv_project.valueChanged.connect(self._rv_project_changed)
+            self._rv_batch_size.valueChanged.connect(lambda _: self._rv_render())
+            self._rv_version.currentIndexChanged.connect(lambda _: self._rv_invalidate())
+            self._rv_only_unlabeled.toggled.connect(lambda _: self._rv_invalidate())
+            self._ls_task_project.valueChanged.connect(self._rv_project.setValue)
+            return w
+
+        def _rv_client(self):
+            return self.client if self.client is not None else None
+
+        def _rv_invalidate(self):
+            if self._rv_busy:
+                return
+            self._rv_loaded_project = -1
+            self._rv_items = []
+            self._rv_checked.clear()
+            self._rv_box_sel.clear()
+            self._rv_batch = 0
+            self._rv_table.setRowCount(0)
+            self._rv_batch_info.setText("—")
+            self._rv_accept_btn.setEnabled(False)
+            _set_status(self._rv_status, "筛选条件已变化，点击“加载”", "warn")
+
+        def _rv_project_changed(self, pid: int):
+            if pid != self._rv_loaded_project:
+                self._rv_invalidate()
+
+        def _rv_auto_load(self):
+            if self._rv_client() is None or self._rv_busy:
+                return
+            pid = self._ls_task_project.value()
+            if pid <= 0:
+                return
+            if pid != self._rv_project.value():
+                self._rv_project.setValue(pid)
+            if pid != self._rv_loaded_project:
+                self._rv_load()
+
+        def _rv_load(self):
+            if self._rv_client() is None:
+                QMessageBox.warning(self, "提示", "请先在 ② 标注管理连接 Label Studio。")
+                return
+            if self._rv_busy:
+                return
+            pid = self._rv_project.value()
+            if pid <= 0:
+                QMessageBox.warning(self, "提示", "请填写项目 ID。")
+                return
+            version = self._rv_version.currentData() or ""
+            only_unlabeled = self._rv_only_unlabeled.isChecked()
+            self._rv_busy = True
+            self._rv_load_btn.setEnabled(False)
+            _set_status(self._rv_status, "加载中…", "warn")
+
+            def fn():
+                from review import scan_review
+                return scan_review(pid, version=version,
+                                   only_unlabeled=only_unlabeled,
+                                   client=self.client)
+
+            def done(items):
+                self._rv_busy = False
+                self._rv_load_btn.setEnabled(True)
+                self._rv_loaded_project = pid
+                self._rv_items = list(items)
+                self._rv_checked.clear()
+                self._rv_box_sel.clear()
+                self._rv_batch = 0
+                versions = sorted({i.version for i in items})
+                current = self._rv_version.currentData() or ""
+                self._rv_version.blockSignals(True)
+                self._rv_version.clear()
+                self._rv_version.addItem("全部版本", "")
+                for v in versions:
+                    self._rv_version.addItem(v, v)
+                idx = self._rv_version.findData(current)
+                self._rv_version.setCurrentIndex(idx if idx >= 0 else 0)
+                self._rv_version.blockSignals(False)
+                self._rv_render()
+                total = len(items)
+                if total:
+                    _set_status(self._rv_status,
+                                f"已加载 {total} 条待复核（项目 {pid}）", "ok")
+                else:
+                    _set_status(self._rv_status,
+                                f"项目 {pid} 没有待复核的预标注结果", "idle")
+
+            def failed(_e):
+                self._rv_busy = False
+                self._rv_load_btn.setEnabled(True)
+                _set_status(self._rv_status, "加载失败", "err")
+
+            self._run_task(fn, done, "加载复核数据", on_error=failed)
+
+        def _rv_pages(self) -> int:
+            size = self._rv_batch_size.value()
+            return max(1, (len(self._rv_items) + size - 1) // size)
+
+        def _rv_page(self, delta: int):
+            target = self._rv_batch + delta
+            if 0 <= target < self._rv_pages():
+                self._rv_batch = target
+                self._rv_render()
+
+        def _rv_page_items(self):
+            size = self._rv_batch_size.value()
+            start = self._rv_batch * size
+            return self._rv_items[start:start + size]
+
+        def _rv_render(self):
+            if not hasattr(self, "_rv_table"):
+                return
+            pag = self._rv_pages()
+            self._rv_batch = min(self._rv_batch, pag - 1)
+            items = self._rv_page_items()
+            self._rv_table.blockSignals(True)
+            self._rv_table.setRowCount(len(items))
+            for row, item in enumerate(items):
+                chk = QTableWidgetItem()
+                chk.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable)
+                chk.setCheckState(Qt.Checked if item.task_id in self._rv_checked else Qt.Unchecked)
+                chk.setData(Qt.UserRole, item.task_id)
+                self._rv_table.setItem(row, 0, chk)
+                self._rv_table.setItem(row, 1, QTableWidgetItem(str(item.task_id)))
+                self._rv_table.setItem(row, 2, QTableWidgetItem(str(item.boxes)))
+                self._rv_table.setItem(row, 3, QTableWidgetItem(item.version))
+                state = "已标注" if item.is_labeled else "未标注"
+                self._rv_table.setItem(row, 4, QTableWidgetItem(state))
+            self._rv_table.blockSignals(False)
+            if self._rv_items:
+                self._rv_batch_info.setText(
+                    f"第 {self._rv_batch + 1}/{pag} 批 · 本批 {len(items)} 条 · "
+                    f"已勾选 {len(self._rv_checked)} 条 · 共 {len(self._rv_items)} 条")
+            else:
+                self._rv_batch_info.setText("—")
+            self._rv_accept_btn.setEnabled(bool(self._rv_checked) and not self._rv_busy)
+
+        def _rv_item_changed(self, item: QTableWidgetItem):
+            if item.column() != 0:
+                return
+            tid = item.data(Qt.UserRole)
+            if tid is None:
+                return
+            if item.checkState() == Qt.Checked:
+                self._rv_checked.add(int(tid))
+            else:
+                self._rv_checked.discard(int(tid))
+            self._rv_accept_btn.setEnabled(bool(self._rv_checked) and not self._rv_busy)
+            if self._rv_items:
+                self._rv_batch_info.setText(
+                    f"第 {self._rv_batch + 1}/{self._rv_pages()} 批 · 本批 "
+                    f"{len(self._rv_page_items())} 条 · 已勾选 {len(self._rv_checked)} 条 · "
+                    f"共 {len(self._rv_items)} 条")
+
+        def _rv_select_page(self):
+            for item in self._rv_page_items():
+                self._rv_checked.add(item.task_id)
+            self._rv_render()
+
+        def _rv_select_none(self):
+            self._rv_checked.clear()
+            self._rv_render()
+
+        def _rv_current_item(self):
+            row = self._rv_table.currentRow()
+            if row < 0:
+                return None
+            item = self._rv_table.item(row, 1)
+            if item is None:
+                return None
+            tid = int(item.text())
+            for it in self._rv_items:
+                if it.task_id == tid:
+                    return it
+            return None
+
+        def _rv_adjust_boxes(self):
+            item = self._rv_current_item()
+            if item is None:
+                QMessageBox.information(self, "提示", "先在表格中选中一条任务。")
+                return
+            default = set(self._rv_box_sel.get(item.task_id, range(item.boxes)))
+            dlg = QDialog(self)
+            dlg.setWindowTitle(f"调整框 · 任务 {item.task_id}")
+            dlg.resize(640, 380)
+            lay = QVBoxLayout(dlg)
+            info = QLabel(f"预测版本 {item.version} · 共 {item.boxes} 个框；"
+                          "只保留勾选的框。")
+            lay.addWidget(info)
+            tbl = QTableWidget(len(item.result), 7)
+            tbl.setHorizontalHeaderLabels(["认可", "#", "类别", "置信度", "x", "y", "宽×高"])
+            tbl.verticalHeader().setVisible(False)
+            tbl.setEditTriggers(QTableWidget.NoEditTriggers)
+            tbl.horizontalHeader().setStretchLastSection(True)
+            for i, res in enumerate(item.result):
+                chk = QTableWidgetItem()
+                chk.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable)
+                chk.setCheckState(Qt.Checked if i in default else Qt.Unchecked)
+                chk.setData(Qt.UserRole, i)
+                tbl.setItem(i, 0, chk)
+                tbl.setItem(i, 1, QTableWidgetItem(str(i)))
+                val = res.get("value", {}) if isinstance(res, dict) else {}
+                labels = val.get("rectanglelabels") or []
+                tbl.setItem(i, 2, QTableWidgetItem("/".join(map(str, labels))))
+                score = res.get("score") if isinstance(res, dict) else None
+                tbl.setItem(i, 3, QTableWidgetItem("" if score is None else f"{float(score):.2f}"))
+                tbl.setItem(i, 4, QTableWidgetItem(f"{val.get('x', 0):.2f}"))
+                tbl.setItem(i, 5, QTableWidgetItem(f"{val.get('y', 0):.2f}"))
+                tbl.setItem(i, 6, QTableWidgetItem(
+                    f"{val.get('width', 0):.2f}% × {val.get('height', 0):.2f}%"))
+            lay.addWidget(tbl)
+            ops = QHBoxLayout()
+            all_btn = QPushButton("全选")
+            all_btn.clicked.connect(lambda: [tbl.item(i, 0).setCheckState(Qt.Checked)
+                                             for i in range(tbl.rowCount())])
+            none_btn = QPushButton("全不选")
+            none_btn.clicked.connect(lambda: [tbl.item(i, 0).setCheckState(Qt.Unchecked)
+                                              for i in range(tbl.rowCount())])
+            ops.addWidget(all_btn)
+            ops.addWidget(none_btn)
+            ops.addStretch()
+            lay.addLayout(ops)
+            buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+            buttons.accepted.connect(dlg.accept)
+            buttons.rejected.connect(dlg.reject)
+            lay.addWidget(buttons)
+            if dlg.exec() != QDialog.Accepted:
+                return
+            chosen = [i for i in range(tbl.rowCount())
+                      if tbl.item(i, 0).checkState() == Qt.Checked]
+            self._rv_box_sel[item.task_id] = chosen
+            if item.task_id not in self._rv_checked:
+                self._rv_checked.add(item.task_id)
+            self._rv_render()
+            if not chosen:
+                QMessageBox.information(self, "提示",
+                                        "该任务未勾选任何框，认可时会跳过。")
+
+        def _rv_open_task(self):
+            if self._rv_client() is None:
+                return
+            item = self._rv_current_item()
+            if item is None:
+                checked = [i for i in self._rv_items if i.task_id in self._rv_checked]
+                item = checked[0] if checked else None
+            if item is None:
+                QMessageBox.information(self, "提示", "先选中一条任务。")
+                return
+            base = str(self.client.base_url).rstrip("/")
+            pid = self._rv_project.value()
+            webbrowser.open(f"{base}/projects/{pid}/data?task={item.task_id}")
+
+        def _rv_accept(self):
+            if self._rv_client() is None or self._rv_busy:
+                return
+            chosen = [i for i in self._rv_items if i.task_id in self._rv_checked]
+            if not chosen:
+                QMessageBox.information(self, "提示", "没有勾选任何任务。")
+                return
+            if QMessageBox.question(
+                    self, "确认认可",
+                    f"将把 {len(chosen)} 条任务转为人工标注（只保留已选中的框）。\n"
+                    "认可后任务会变成“已标注”，不再出现在待复核列表。是否继续？",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No) != QMessageBox.Yes:
+                return
+            pid = self._rv_project.value()
+            selections = {it.task_id: self._rv_box_sel[it.task_id]
+                          for it in chosen if it.task_id in self._rv_box_sel}
+            self._rv_busy = True
+            self._rv_accept_btn.setEnabled(False)
+            self._rv_load_btn.setEnabled(False)
+            _set_status(self._rv_status, f"认可 {len(chosen)} 条…", "warn")
+
+            def fn():
+                from review import accept_items
+                return accept_items(pid, chosen, selections=selections,
+                                    client=self.client)
+
+            def done(stats):
+                self._rv_busy = False
+                accepted = set(stats.get("accepted_ids") or [])
+                self._rv_items = [i for i in self._rv_items if i.task_id not in accepted]
+                for tid in accepted:
+                    self._rv_checked.discard(tid)
+                    self._rv_box_sel.pop(tid, None)
+                self._rv_batch = min(self._rv_batch, self._rv_pages() - 1)
+                self._rv_render()
+                self._rv_load_btn.setEnabled(True)
+                _set_status(self._rv_status,
+                            f"认可 {stats.get('accepted', 0)} 条，跳过 "
+                            f"{stats.get('skipped', 0)}，失败 {stats.get('failed', 0)}",
+                            "ok" if not stats.get("failed") else "warn")
+                QMessageBox.information(
+                    self, "复核完成",
+                    f"认可 {stats.get('accepted', 0)} 条（{stats.get('boxes', 0)} 个框）\n"
+                    f"跳过 {stats.get('skipped', 0)}，失败 {stats.get('failed', 0)}")
+                if stats.get("errors"):
+                    self._log_append("❌ 部分任务认可失败：")
+                    for err in stats["errors"]:
+                        self._log_append(f"  任务 {err['task_id']}: {err['error']}")
+
+            def failed(_e):
+                self._rv_busy = False
+                self._rv_load_btn.setEnabled(True)
+                _set_status(self._rv_status, "认可失败", "err")
+
+            self._run_task(fn, done, "认可复核结果", on_error=failed)
 
         # ============================================================
         # 通用方法

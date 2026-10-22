@@ -60,6 +60,8 @@ ctts/
 │   ├── label_studio_main.py     # LS CLI 入口
 │   ├── prelabel.py        # ★ 小模型预标注流水线
 │   ├── test_prelabel.py   # 预标注离线单测（无需 LS/GPU）
+│   ├── review.py          # 预标注复核：扫描批次、批量认可为 annotation
+│   ├── test_review.py     # 复核逻辑离线单测
 │   ├── pyproject.toml     # 依赖声明
 │   └── .gitignore
 ├── docs/                  # 设计文档
@@ -148,7 +150,7 @@ source ~/.cache/ctts-venv/bin/activate
 python ctts.py --gui
 ```
 
-GUI 包含六个 Tab：
+GUI 包含七个 Tab：
 
 - **📦 数据准备** — 视频抽帧、质量过滤、数据集划分
 - **🏷️ 标注管理** — Label Studio 项目与任务管理；上传逐张显示进度，项目列表展示已标注数/进度并每 15s 自动刷新
@@ -156,6 +158,7 @@ GUI 包含六个 Tab：
 - **🗂️ 数据集划分** — 已标注数据划分为 train/val
 - **🚀 训练** — YOLO 训练参数配置、高级参数调试与启动
 - **🔍 推理** — 实时检测窗口启动
+- **🧐 复核** — 按批次查看预标注结果，勾选任务/调整预测框后批量认可为人工标注
 
 ## 小模型预标注
 
@@ -175,12 +178,15 @@ GUI 包含六个 Tab：
 3. **训练并导出** — 以 `weights/yolo26n.pt` 为基座微调，导出 `best.onnx` 并做加载自检。
 4. **API 预标注** — 只处理未标注任务，分批写入 Label Studio predictions；
    同一版本标签默认跳过，勾选「覆盖」才会重写。
-5. **人工复核** — 在 Label Studio 中确认/修正预测并提交；工具不会自动接受预测。
+5. **人工复核** — 在 ⑦ 复核页按批次处理：可整批全选、逐任务勾选，或点「调整选中框…」
+   只保留部分预测框；认可后写成正式 annotation。也可直接跳转 Label Studio 修改。
 
 产物固定落在 `runs/prelabel/<run_id>/`（dataset、train、model、report.json、run.log），
 版本标签形如 `ctts-prelabel:v1@480`，可在「仅预标注」时复用历史模型。
 
-> 复核抽样 CSV 与待复核数量统计在「④ 复核」分组；预测框不会被自动确认为标注。
+> 复核页默认只列出 `ctts-prelabel*` 预测、默认只看未标注任务；每条任务会先重新校验
+> 是否已被他人标注，避免并发重复。认可操作只创建 annotation，不删除原 prediction。
+> 原「④ 复核」分组中的抽样 CSV / 待复核统计仍保留在 ③ 预标注页。
 
 ## Label Studio 集成
 
