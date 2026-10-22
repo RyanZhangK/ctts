@@ -1884,9 +1884,13 @@ def gui_main():
             self._rv_accept_btn.setStyleSheet(PRIMARY_BTN_QSS)
             self._rv_accept_btn.clicked.connect(self._rv_accept)
             ops.addWidget(self._rv_accept_btn)
+            self._rv_accept_batch_btn = QPushButton("认可本批全部")
+            self._rv_accept_batch_btn.setStyleSheet(PRIMARY_BTN_QSS)
+            self._rv_accept_batch_btn.clicked.connect(self._rv_accept_batch)
+            ops.addWidget(self._rv_accept_batch_btn)
             bl.addLayout(ops)
-            hint = QLabel("勾选任务后点“认可选中”；默认认可该任务全部预测框，"
-                          "可先用“调整选中框…”只保留部分框。")
+            hint = QLabel("勾选任务后点“认可选中”；点“认可本批全部”一键认可当前批次；"
+                          "默认认可该任务全部预测框，可先用“调整选中框…”只保留部分框。")
             hint.setStyleSheet(MUTED_QSS)
             bl.addWidget(hint)
             layout.addWidget(grp2)
@@ -2150,6 +2154,14 @@ def gui_main():
             base = str(self.client.base_url).rstrip("/")
             pid = self._rv_project.value()
             webbrowser.open(f"{base}/projects/{pid}/data?task={item.task_id}")
+
+        def _rv_accept_batch(self):
+            """勾选当前页全部任务并提交。"""
+            if not self._rv_items:
+                QMessageBox.information(self, "提示", "请先加载复核数据。")
+                return
+            self._rv_check_page(True)
+            self._rv_accept()
 
         def _rv_accept(self):
             if self._rv_client() is None or self._rv_busy:
