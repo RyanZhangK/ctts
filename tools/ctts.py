@@ -1112,6 +1112,7 @@ def gui_main():
             mrow = QHBoxLayout()
             self._pre_model = QComboBox()
             self._pre_model.addItem("自动：最新 ONNX", "")
+            self._pre_model.currentIndexChanged.connect(self._pre_on_model_changed)
             mrow.addWidget(self._pre_model)
             self._pre_model_btn = QPushButton("选择…")
             self._pre_model_btn.clicked.connect(self._pre_choose_model)
@@ -1286,6 +1287,21 @@ def gui_main():
                 _set_status(self._pre_status, suggestion,
                             "warn" if verdict == "marginal" else "err")
 
+        def _pre_on_model_changed(self, _index=None):
+            """选中带 manifest 的模型时，自动采用其导出 imgsz。"""
+            model = self._pre_model.currentData()
+            if not model:
+                return
+            try:
+                import json
+                data = json.loads(
+                    (Path(model).parent / "manifest.json").read_text())
+                imgsz = int(data.get("imgsz", 0))
+            except (OSError, ValueError, TypeError):
+                return
+            if self._pre_imgsz.minimum() <= imgsz <= self._pre_imgsz.maximum():
+                self._pre_imgsz.setValue(imgsz)
+
         def _pre_refresh_models(self):
             try:
                 from prelabel import RUN_ROOT
@@ -1378,7 +1394,7 @@ def gui_main():
                 tag = tag_from_manifest(model, imgsz) or make_tag("manual", imgsz)
                 return prelabel_project(
                     project_id, model=model, tag=tag, conf=conf, iou=iou,
-                    imgsz=imgsz, skip=not self._pre_overwrite.isChecked(),
+                    imgsz=imgsz,
                     overwrite=self._pre_overwrite.isChecked(),
                     device=self._pre_device_value(), on_event=on_event,
                     should_stop=self._pre_label_cancel.is_set,
