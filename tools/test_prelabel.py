@@ -317,6 +317,29 @@ class PipelineClientTest(unittest.TestCase):
         self.assertIsNone(seen.get("client"))
 
 
+class TrainPathsTest(unittest.TestCase):
+    def test_relative_weights_under_run_dir(self):
+        with tempfile.TemporaryDirectory() as d:
+            run = Path(d).resolve()
+            best = run / "train" / "exp" / "weights" / "best.pt"
+            best.parent.mkdir(parents=True)
+            best.write_text("x")
+            result = P.TrainResult(run_dir=run, best_pt=str(best),
+                                   metrics={}, args={})
+            self.assertEqual(P._relative_weights(result),
+                             "train/exp/weights/best.pt")
+
+    def test_relative_weights_outside_run_dir_falls_back(self):
+        with tempfile.TemporaryDirectory() as d:
+            run = Path(d).resolve()
+            outside = run.parent / "elsewhere" / "best.pt"
+            outside.parent.mkdir(parents=True, exist_ok=True)
+            outside.write_text("x")
+            result = P.TrainResult(run_dir=run, best_pt=str(outside),
+                                   metrics={}, args={})
+            self.assertEqual(P._relative_weights(result), str(outside))
+
+
 class TrainArgsTest(unittest.TestCase):
     """高级训练参数：默认值、合并、托管项与 JSON/--set 校验。"""
 

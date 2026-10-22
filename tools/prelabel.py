@@ -912,12 +912,14 @@ def train_micro(
     """在微数据集上微调 nano 模型；train_overrides 可覆盖任意训练参数。"""
     from ultralytics import YOLO
 
-    data_yaml = dataset.root / "data.yaml"
+    data_yaml = (dataset.root / "data.yaml").resolve()
     if not data_yaml.is_file():
         raise RuntimeError(f"缺少 data.yaml: {data_yaml}")
 
-    run_root = Path(run_dir) if run_dir else (
-        RUN_ROOT / f"{datetime.now():%Y%m%d-%H%M%S}")
+    # ultralytics 会把相对 project 拼到 runs/<task>/ 下，导致 weights 路径
+    # 变成 runs/detect/runs/...；这里统一转成绝对路径。
+    run_root = (Path(run_dir) if run_dir else (
+        RUN_ROOT / f"{datetime.now():%Y%m%d-%H%M%S}")).resolve()
     run_root.mkdir(parents=True, exist_ok=True)
 
     dev, gpu = _resolve_device(device)
@@ -990,7 +992,7 @@ def train_micro(
         do_train()
 
     trainer = getattr(model, "trainer", None)
-    best = Path(getattr(trainer, "best", "") or (run_root / "train" / "exp" / "weights" / "best.pt"))
+    best = Path(getattr(trainer, "best", "") or (run_root / "train" / "exp" / "weights" / "best.pt")).resolve()
     if not best.is_file():
         best = run_root / "train" / "exp" / "weights" / "last.pt"
     if not best.is_file():
@@ -1102,6 +1104,16 @@ def tag_from_manifest(model_path: str | Path, imgsz: int) -> str | None:
     return None
 
 
+def _relative_weights(result: TrainResult) -> str:
+    best = Path(result.best_pt).resolve()
+    run_dir = Path(result.run_dir).resolve()
+    try:
+        return str(best.relative_to(run_dir))
+    except ValueError:
+        # 旧运行可能落在 runs/detect/runs/... 下，不因清单字段失败。
+        return str(best)
+
+
 def _write_manifest(result: TrainResult, *, version: str, run_id: str,
                     base: str, imgsz: int, dataset: DatasetInfo,
                     ls_project: int, marginal: bool) -> dict:
@@ -1110,7 +1122,7 @@ def _write_manifest(result: TrainResult, *, version: str, run_id: str,
         "version": version,
         "run_id": run_id,
         "base": base,
-        "weights": str(Path(result.best_pt).relative_to(result.run_dir)),
+        "weights": _relative_weights(result),
         "onnx": "model/best.onnx",
         "imgsz": imgsz,
         "classes": dataset.classes,
