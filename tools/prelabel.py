@@ -1425,6 +1425,7 @@ def run_pipeline(
     skip_train: bool = False,
     images_dir: str | None = None,
     train_overrides: dict | None = None,
+    client=None,
     on_event=None,
     should_stop: Callable[[], bool] | None = None,
     log: Callable[[str], None] | None = None,
@@ -1443,7 +1444,7 @@ def run_pipeline(
             log(f"跳过训练，直接预标注：{model}")
         stats = prelabel_project(project_id, model=model, imgsz=imgsz,
                                  conf=conf, iou=iou, device=device,
-                                 images_dir=images_dir,
+                                 images_dir=images_dir, client=client,
                                  on_event=on_event, should_stop=should_stop,
                                  log=log)
         report["prelabel"] = stats.to_dict()
@@ -1453,7 +1454,7 @@ def run_pipeline(
     current_run_dir: Path | None = None
     try:
         _emit(on_event, "assess", "start", "评估数据…")
-        assessment = assess_project(project_id, log=log)
+        assessment = assess_project(project_id, client=client, log=log)
         report["assessment"] = assessment.to_dict()
         _emit(on_event, "assess", "done",
               f"评估完成：{assessment.verdict}（{assessment.labeled_tasks} 张 / "
@@ -1467,7 +1468,8 @@ def run_pipeline(
         current_run_dir = run_dir
         current_stage = "dataset"
         dataset = build_micro_dataset(
-            project_id, out_dir=str(run_dir / "dataset"), images_dir=images_dir,
+            project_id, out_dir=str(run_dir / "dataset"),
+            images_dir=images_dir, client=client,
             on_event=on_event, should_stop=should_stop, log=log)
         report["dataset"] = dataset.to_dict()
 
@@ -1494,7 +1496,7 @@ def run_pipeline(
         stats = prelabel_project(
             project_id, model=str(train_result.onnx), tag=manifest["tag"],
             conf=conf, iou=iou, imgsz=effective_imgsz, device=device,
-            images_dir=images_dir,
+            images_dir=images_dir, client=client,
             on_event=on_event, should_stop=should_stop, log=log)
         report["prelabel"] = stats.to_dict()
     except Exception as e:
@@ -1657,7 +1659,7 @@ def main():
                          imgsz=args.imgsz, conf=args.conf, iou=args.iou,
                          images_dir=args.images_dir, skip_train=args.skip_train,
                          reuse_model=args.model, train_overrides=train_overrides,
-                         log=log, on_event=on_event)
+                         client=client, log=log, on_event=on_event)
 
     except KeyboardInterrupt:
         print("\n⚠ 已中断（已完成阶段保留）")

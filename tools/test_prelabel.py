@@ -287,6 +287,36 @@ class TestBuildDataset(unittest.TestCase):
             self.assertTrue(content.startswith("0 "))
 
 
+class PipelineClientTest(unittest.TestCase):
+    """③ 预标注必须复用 ② 的连接，而不是回落到本地默认 client。"""
+
+    def test_run_pipeline_forwards_client(self):
+        import unittest.mock as mock
+        with tempfile.NamedTemporaryFile(suffix=".onnx") as f:
+            seen = {}
+
+            def fake_prelabel(project_id, **kwargs):
+                seen.update(kwargs)
+                return SimpleNamespace(to_dict=lambda: {"ok": True})
+
+            with mock.patch.object(P, "prelabel_project", fake_prelabel):
+                P.run_pipeline(1, reuse_model=f.name, skip_train=True, client="REMOTE")
+        self.assertEqual(seen["client"], "REMOTE")
+
+    def test_run_pipeline_default_client_is_none(self):
+        import unittest.mock as mock
+        with tempfile.NamedTemporaryFile(suffix=".onnx") as f:
+            seen = {}
+
+            def fake_prelabel(project_id, **kwargs):
+                seen.update(kwargs)
+                return SimpleNamespace(to_dict=lambda: {"ok": True})
+
+            with mock.patch.object(P, "prelabel_project", fake_prelabel):
+                P.run_pipeline(1, reuse_model=f.name, skip_train=True)
+        self.assertIsNone(seen.get("client"))
+
+
 class TrainArgsTest(unittest.TestCase):
     """高级训练参数：默认值、合并、托管项与 JSON/--set 校验。"""
 

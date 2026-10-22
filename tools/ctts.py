@@ -297,12 +297,6 @@ def gui_main():
             self.resize(960, 700)
             self.client = None
             self._workers = []
-
-            try:
-                self.client = get_client()
-            except Exception:
-                self.client = None
-
             self._build_ui()
 
         def _build_ui(self):
@@ -341,6 +335,11 @@ def gui_main():
             self._pre_project.valueChanged.connect(self._pre_on_project_changed)
             self._pre_refresh_models()
             self._pre_update_connection()
+            self._tabs.currentChanged.connect(self._on_tab_changed)
+
+        def _on_tab_changed(self, index: int):
+            if index == 2:
+                self._pre_update_connection()
 
         # ============================================================
         # ① 数据准备 Tab
@@ -520,6 +519,7 @@ def gui_main():
             cl = QFormLayout(grp_conn)
             self._ls_url = QLineEdit(resolve_base_url())
             self._ls_url.setPlaceholderText(DEFAULT_BASE_URL)
+            self._ls_url.textEdited.connect(self._ls_invalidate_connection)
             cl.addRow("地址:", self._ls_url)
             self._ls_token = QLineEdit()
             _echo = getattr(QLineEdit, "Password", None)
@@ -531,6 +531,7 @@ def gui_main():
             env_tok = os.environ.get("LABEL_STUDIO_TOKEN", "")
             if env_tok:
                 self._ls_token.setText(env_tok)
+            self._ls_token.textEdited.connect(self._ls_invalidate_connection)
             cl.addRow("Token:", self._ls_token)
             conn_btn_row = QHBoxLayout()
             btn_connect = QPushButton("连接 / 重连")
@@ -539,8 +540,7 @@ def gui_main():
             self._ls_conn_status = QLabel()
             _set_status(
                 self._ls_conn_status,
-                f"已连接: {self.client.base_url}" if self.client else "未连接",
-                "ok" if self.client else "warn")
+                "未连接（填写地址/Token 后点「连接 / 重连」）", "warn")
             conn_btn_row.addWidget(self._ls_conn_status)
             conn_btn_row.addStretch()
             cl.addRow(conn_btn_row)
@@ -649,10 +649,18 @@ def gui_main():
             self._ls_timer.setInterval(15000)
             self._ls_timer.timeout.connect(self._ls_auto_tick)
 
-            # 已自动连上则刷新；否则等用户点「连接 / 重连」
-            if self.client is not None:
-                self._ls_refresh_projects()
             return w
+
+        def _ls_invalidate_connection(self, *_args):
+            """地址 / Token 被手动修改后，旧连接失效，③ 同步回到未连接。"""
+            if self.client is None:
+                return
+            self.client = None
+            self._ls_connected_ok = False
+            self._ls_timer.stop()
+            _set_status(self._ls_conn_status,
+                        "连接配置已修改，请点「连接 / 重连」", "warn")
+            self._pre_update_connection()
 
         def _ls_reconnect(self):
             """按界面上的地址 / Token 连接本机或远程 Label Studio。"""
@@ -737,15 +745,23 @@ def gui_main():
                 table.setItem(i, 4, item)
             table.blockSignals(False)
             table.clearSelection()
-            if select_id is not None:
+            ids = [int(p["id"]) for p in projects]
+            target = select_id
+            if target is None and ids and self._pre_project.value() not in ids:
+                # 远程项目列表里没有 ③ 当前项目 ID：同步到第一个项目，
+                # 避免 ③ 还停留在启动时的本地默认值 10。
+                target = ids[0]
+            if target is not None:
                 # 静默恢复选中行：不触发 selectionChanged，避免自动刷新覆盖
                 # 用户手动输入的任务/上传项目 ID。
                 table.blockSignals(True)
                 for row in range(table.rowCount()):
-                    if table.item(row, 0).text() == str(select_id):
+                    if table.item(row, 0).text() == str(target):
                         table.selectRow(row)
                         break
                 table.blockSignals(False)
+                if select_id is None and target != self._pre_project.value():
+                    self._ls_task_project.setValue(target)
             if self._ls_auto_cb.isChecked() and not self._ls_timer.isActive():
                 self._ls_timer.start()
             from datetime import datetime as _dt
@@ -997,6 +1013,9 @@ def gui_main():
             self._pre_conn_hint = QLabel("请先在 ② 标注管理连接 Label Studio")
             _set_status(self._pre_conn_hint, self._pre_conn_hint.text(), "warn")
             layout.addWidget(self._pre_conn_hint)
+            self._pre_conn_info = QLabel("连接: 未连接")
+            _set_status(self._pre_conn_info, "连接: 未连接", "idle")
+            layout.addWidget(self._pre_conn_info)
 
             # ---- ① 数据就绪 ----
             grp = QGroupBox("① 数据就绪")
@@ -1192,6 +1211,11 @@ def gui_main():
         def _pre_update_connection(self):
             ok = self.client is not None
             self._pre_conn_hint.setVisible(not ok)
+            if ok:
+                _set_status(self._pre_conn_info,
+                            f"连接: {self.client.base_url}（来自 ② 标注管理）", "ok")
+            else:
+                _set_status(self._pre_conn_info, "连接: 未连接", "idle")
             self._pre_apply_enabled()
 
         def _pre_apply_enabled(self):
@@ -1325,7 +1349,7 @@ def gui_main():
                     project_id, base_weights=weights, epochs=epochs,
                     imgsz=imgsz, conf=conf, iou=iou, freeze=freeze,
                     device=device, train_overrides=train_overrides,
-                    on_event=on_event,
+                    client=self.client, on_event=on_event,
                     should_stop=self._pre_label_cancel.is_set, log=log)
 
             self._pre_start_worker(fn, "pipeline")
