@@ -372,6 +372,8 @@ client.projects.import_predictions(
 
 - **待复核** = 有 `tag` prediction 且无 annotation 的任务数；
 - **已提交** = 复核窗口内新增 annotation 数；
+- **布局**：左侧任务表（按批），右侧图片预览画布；预测框实线=已认可、虚线=将丢弃，
+  点击框即可切换；图片按 `task.image` 下载，内存缓存 24 张（LRU），失败时提示并引导到 LS。
 - 按钮：`打开 Label Studio`（`{base_url}/projects/{pid}`）、`导出抽样清单`（默认 10% 随机 + 固定种子 CSV）。
 
 ### 7.2 复核规则（写进 UI 提示，不写进任务指令）
@@ -797,5 +799,6 @@ python ctts.py prelabel review -p 10 --tag ctts-prelabel:v1@480 --sample 0.1
 - [x] 统一状态色常量，并同步 ② 页签
 - [x] README：新流程、命令、目录结构
 - [x] `tools/review.py` + `⑦ 复核` Tab：按批加载、逐任务勾选、框级子集、批量认可为 annotation
+- [x] `⑦ 复核` 图片预览：左侧任务表 + 右侧画布，预测框可点击切换，图片按需下载缓存
 - [x] `tools/test_review.py`（4 项离线单测）：扫描过滤/最新版本、部分框、跳过已标注、失败收集
 - [ ] 本机 E2E：30 张标注 → 训练 2 epoch → 预标注 → 复核（当前环境无 LS 服务/数据，未执行）

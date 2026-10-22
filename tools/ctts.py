@@ -28,6 +28,17 @@ import threading
 import webbrowser
 from pathlib import Path
 
+_REVIEW_MODULE = None
+
+
+def _load_review_module():
+    """在 GUI 主线程懒加载 review，避免在 QThread 内首次导入 SDK。"""
+    global _REVIEW_MODULE
+    if _REVIEW_MODULE is None:
+        import review as module
+        _REVIEW_MODULE = module
+    return _REVIEW_MODULE
+
 
 # ---------------------------------------------------------------------------
 # CLI
@@ -175,8 +186,8 @@ def gui_main():
         sys.path.insert(0, tools_dir)
 
     try:
-        from PySide6.QtCore import Qt, QThread, QTimer, Signal
-        from PySide6.QtGui import QFont
+        from PySide6.QtCore import Qt, QThread, QTimer, Signal, QRectF, QPointF
+        from PySide6.QtGui import QFont, QPixmap, QPainter, QColor, QPen
         from PySide6.QtWidgets import (
             QApplication, QWidget, QVBoxLayout, QHBoxLayout,
             QTabWidget, QPushButton, QLabel, QLineEdit,
@@ -184,7 +195,7 @@ def gui_main():
             QGroupBox, QFormLayout, QSpinBox, QProgressBar,
             QMainWindow, QFileDialog, QTextEdit, QComboBox,
             QCheckBox, QDoubleSpinBox, QSlider, QScrollArea,
-            QPlainTextEdit, QDialog, QDialogButtonBox,
+            QPlainTextEdit, QDialog, QDialogButtonBox, QSplitter,
         )
     except ModuleNotFoundError:
         venv_dir = os.path.expanduser(os.environ.get("CTTS_VENV", "~/.cache/ctts-venv"))
@@ -288,6 +299,135 @@ def gui_main():
         def _log(self, msg: str):
             self.log_line.emit(msg)
 
+
+
+    # ---- ReviewCanvas / ReviewImageWorker（⑦ 复核页图片预览） ----
+    class ReviewCanvas(QWidget):
+        """绘制任务图片和预测框；点击框可切换是否认可。"""
+
+        boxClicked = Signal(int)
+
+        def __init__(self):
+            super().__init__()
+            self.setMinimumSize(420, 320)
+            self._pix = None
+            self._boxes = []
+            self._selected: set[int] = set()
+            self._msg = "选择任务查看预测框预览"
+            self._task_id = None
+
+        def set_message(self, msg: str):
+            self._pix = None
+            self._boxes = []
+            self._selected = set()
+            self._msg = msg
+            self.update()
+
+        def set_frame(self, pixmap, boxes, selected, task_id):
+            self._pix = pixmap
+            self._boxes = list(boxes or [])
+            self._selected = set(selected)
+            self._task_id = task_id
+            self.update()
+
+        def set_selected(self, selected):
+            self._selected = set(selected)
+            self.update()
+
+        def _layout(self):
+            pw = self._pix.width() if self._pix is not None else 1
+            ph = self._pix.height() if self._pix is not None else 1
+            vw, vh = self.width(), self.height()
+            scale = min(vw / max(pw, 1), vh / max(ph, 1))
+            ow, oh = int(pw * scale), int(ph * scale)
+            return (vw - ow) // 2, (vh - oh) // 2, ow, oh, scale
+
+        def paintEvent(self, _event):
+            p = QPainter(self)
+            p.fillRect(self.rect(), QColor("#f5f5f5"))
+            p.setRenderHint(QPainter.RenderHint.Antialiasing)
+            if self._pix is None or self._pix.isNull():
+                p.setPen(QColor("#888"))
+                p.drawText(self.rect(), Qt.AlignCenter, self._msg)
+                return
+            ox, oy, ow, oh, _ = self._layout()
+            target = QRectF(ox, oy, ow, oh)
+            p.drawPixmap(target, self._pix, QRectF(self._pix.rect()))
+            p.setFont(QFont("Microsoft YaHei UI", 8))
+            for i, res in enumerate(self._boxes):
+                val = res.get("value", {}) if isinstance(res, dict) else {}
+                try:
+                    x = float(val.get("x", 0) or 0)
+                    y = float(val.get("y", 0) or 0)
+                    bw = float(val.get("width", 0) or 0)
+                    bh = float(val.get("height", 0) or 0)
+                except (TypeError, ValueError):
+                    continue
+                rect = QRectF(ox + x / 100 * ow, oy + y / 100 * oh,
+                              bw / 100 * ow, bh / 100 * oh)
+                sel = i in self._selected
+                pen = QPen(QColor("#16a34a") if sel else QColor("#ef4444"),
+                           2.2 if sel else 1.2)
+                if not sel:
+                    pen.setStyle(Qt.DashLine)
+                p.setPen(pen)
+                p.drawRect(rect)
+                labels = val.get("rectanglelabels") or []
+                text = f"{i + 1}. {'/'.join(str(v) for v in labels) or '?'}"
+                score = res.get("score") if isinstance(res, dict) else None
+                if score is not None:
+                    try:
+                        text += f" {float(score):.2f}"
+                    except (TypeError, ValueError):
+                        pass
+                fm = p.fontMetrics()
+                tw = fm.horizontalAdvance(text) + 6
+                th = fm.height() + 2
+                ty = max(oy, rect.top() - th)
+                p.fillRect(QRectF(rect.left(), ty, tw, th),
+                           QColor(22, 163, 74, 200) if sel else QColor(120, 120, 120, 170))
+                p.setPen(QColor("white"))
+                p.drawText(QRectF(rect.left() + 3, ty, tw, th),
+                           Qt.AlignVCenter | Qt.AlignLeft, text)
+
+        def mousePressEvent(self, event):
+            if self._pix is None or self._pix.isNull():
+                return
+            ox, oy, ow, oh, _ = self._layout()
+            pos = event.position()
+            for i in range(len(self._boxes) - 1, -1, -1):
+                res = self._boxes[i]
+                val = res.get("value", {}) if isinstance(res, dict) else {}
+                try:
+                    x = float(val.get("x", 0) or 0)
+                    y = float(val.get("y", 0) or 0)
+                    bw = float(val.get("width", 0) or 0)
+                    bh = float(val.get("height", 0) or 0)
+                except (TypeError, ValueError):
+                    continue
+                rect = QRectF(ox + x / 100 * ow, oy + y / 100 * oh,
+                              bw / 100 * ow, bh / 100 * oh)
+                if rect.contains(pos):
+                    self.boxClicked.emit(i)
+                    return
+
+    class ReviewImageWorker(QThread):
+        loaded = Signal(int, bytes)
+        failed = Signal(int, str)
+
+        def __init__(self, task_id, client, review_mod):
+            super().__init__()
+            self.task_id = task_id
+            self.client = client
+            self.review_mod = review_mod
+
+        def run(self):
+            try:
+                url = self.review_mod.task_image_url(self.client, self.task_id)
+                data = self.review_mod.fetch_image_bytes(self.client, url)
+                self.loaded.emit(self.task_id, data)
+            except Exception as e:
+                self.failed.emit(self.task_id, str(e))
 
     # ---- 主窗口 ----
     class CTTSWindow(QMainWindow):
@@ -1869,7 +2009,25 @@ def gui_main():
             self._rv_table.horizontalHeader().setStretchLastSection(True)
             self._rv_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
             self._rv_table.itemChanged.connect(self._rv_item_changed)
-            bl.addWidget(self._rv_table)
+            self._rv_table.currentCellChanged.connect(lambda *_: self._rv_on_row_changed())
+
+            # 右侧图片预览：显示任务图片和预测框，点击框切换是否认可。
+            self._rv_canvas = ReviewCanvas()
+            self._rv_canvas.boxClicked.connect(self._rv_toggle_box)
+            self._rv_preview_info = QLabel("选择任务查看预测框预览")
+            self._rv_preview_info.setStyleSheet(MUTED_QSS)
+            preview = QWidget()
+            pl = QVBoxLayout(preview)
+            pl.setContentsMargins(0, 0, 0, 0)
+            pl.addWidget(self._rv_canvas, 1)
+            pl.addWidget(self._rv_preview_info)
+            split = QSplitter(Qt.Horizontal)
+            split.addWidget(self._rv_table)
+            split.addWidget(preview)
+            split.setStretchFactor(0, 3)
+            split.setStretchFactor(1, 4)
+            split.setSizes([460, 520])
+            bl.addWidget(split, 1)
 
             ops = QHBoxLayout()
             for text, slot in (("全选本批", self._rv_select_page),
@@ -1899,6 +2057,8 @@ def gui_main():
             self._rv_items = []
             self._rv_checked: set[int] = set()
             self._rv_box_sel: dict[int, list[int]] = {}
+            self._rv_pix_cache: dict[int, QPixmap] = {}
+            self._rv_preview_pending = None
             self._rv_batch = 0
             self._rv_loaded_project = -1
             self._rv_busy = False
@@ -1923,6 +2083,11 @@ def gui_main():
             self._rv_batch = 0
             self._rv_table.setRowCount(0)
             self._rv_batch_info.setText("—")
+            self._rv_pix_cache.clear()
+            self._rv_preview_pending = None
+            self._rv_img_task = None
+            self._rv_canvas.set_message("选择任务查看预测框预览")
+            self._rv_preview_info.setText("选择任务查看预测框预览")
             self._rv_accept_btn.setEnabled(False)
             _set_status(self._rv_status, "筛选条件已变化，点击“加载”", "warn")
 
@@ -1942,6 +2107,7 @@ def gui_main():
                 self._rv_load()
 
         def _rv_load(self):
+            self._rv_preview_pending = None
             if self._rv_client() is None:
                 QMessageBox.warning(self, "提示", "请先在 ② 标注管理连接 Label Studio。")
                 return
@@ -2038,6 +2204,14 @@ def gui_main():
                     f"已勾选 {len(self._rv_checked)} 条 · 共 {len(self._rv_items)} 条")
             else:
                 self._rv_batch_info.setText("—")
+            if items:
+                self._rv_table.blockSignals(True)
+                self._rv_table.selectRow(0)
+                self._rv_table.blockSignals(False)
+                self._rv_on_row_changed()
+            else:
+                self._rv_canvas.set_message("本批没有任务")
+                self._rv_preview_info.setText("—")
             self._rv_accept_btn.setEnabled(bool(self._rv_checked) and not self._rv_busy)
 
         def _rv_item_changed(self, item: QTableWidgetItem):
@@ -2078,6 +2252,99 @@ def gui_main():
                 if it.task_id == tid:
                     return it
             return None
+
+        def _rv_forget_worker(self, w):
+            if w in self._workers:
+                self._workers.remove(w)
+
+        def _rv_on_row_changed(self):
+            item = self._rv_current_item()
+            if item is None:
+                if hasattr(self, "_rv_canvas"):
+                    self._rv_canvas.set_message("选择任务查看预测框预览")
+                return
+            if getattr(self, "_rv_preview_pending", None) == item.task_id:
+                return
+            self._rv_img_task = item.task_id
+            pix = self._rv_pix_cache.get(item.task_id)
+            if pix is not None:
+                self._rv_show_canvas(item, pix)
+                return
+            if self._rv_client() is None:
+                self._rv_canvas.set_message("未连接 Label Studio")
+                return
+            self._rv_canvas.set_message(f"加载任务 {item.task_id} 的图片…")
+            self._rv_preview_info.setText(
+                f"任务 {item.task_id} · {item.boxes} 个预测框 · 加载图片…")
+            try:
+                review_mod = _load_review_module()
+            except Exception as e:
+                self._rv_canvas.set_message(f"预览模块不可用：{e}")
+                return
+            self._rv_preview_pending = item.task_id
+            w = ReviewImageWorker(item.task_id, self.client, review_mod)
+            w.loaded.connect(self._rv_preview_loaded)
+            w.failed.connect(self._rv_preview_failed)
+            w.finished.connect(lambda w=w: self._rv_forget_worker(w))
+            self._workers.append(w)
+            w.start()
+
+        def _rv_show_canvas(self, item, pix):
+            sel = set(self._rv_box_sel.get(item.task_id, range(item.boxes)))
+            self._rv_canvas.set_frame(pix, item.result, sel, item.task_id)
+            self._rv_preview_info.setText(
+                f"任务 {item.task_id} · {item.boxes} 个预测框 · 已选 {len(sel)} 个"
+                "（点击框可切换是否认可）")
+
+        def _rv_preview_loaded(self, task_id: int, data: bytes):
+            if getattr(self, "_rv_preview_pending", None) == task_id:
+                self._rv_preview_pending = None
+            pix = QPixmap()
+            if not pix.loadFromData(data):
+                if task_id == getattr(self, "_rv_img_task", None):
+                    self._rv_canvas.set_message("图片下载成功但无法解码")
+                return
+            self._rv_pix_cache[task_id] = pix
+            while len(self._rv_pix_cache) > 24:
+                self._rv_pix_cache.pop(next(iter(self._rv_pix_cache)))
+            item = self._rv_current_item()
+            if (item is not None and item.task_id == task_id
+                    and task_id == getattr(self, "_rv_img_task", None)):
+                self._rv_show_canvas(item, pix)
+
+        def _rv_preview_failed(self, task_id: int, msg: str):
+            if getattr(self, "_rv_preview_pending", None) == task_id:
+                self._rv_preview_pending = None
+            if task_id != getattr(self, "_rv_img_task", None):
+                return
+            self._rv_canvas.set_message(f"图片加载失败：{msg}")
+            self._rv_preview_info.setText(
+                f"任务 {task_id} · 图片加载失败；可点“在 LS 打开”查看")
+
+        def _rv_toggle_box(self, index: int):
+            item = self._rv_current_item()
+            if item is None or not (0 <= index < item.boxes):
+                return
+            sel = set(self._rv_box_sel.get(item.task_id, range(item.boxes)))
+            if index in sel:
+                sel.discard(index)
+            else:
+                sel.add(index)
+            self._rv_box_sel[item.task_id] = sorted(sel)
+            pix = self._rv_pix_cache.get(item.task_id)
+            if pix is not None:
+                self._rv_show_canvas(item, pix)
+            else:
+                self._rv_canvas.set_selected(sel)
+                self._rv_preview_info.setText(
+                    f"任务 {item.task_id} · {item.boxes} 个预测框 · 已选 {len(sel)} 个")
+
+        def _rv_select_task(self, task_id: int):
+            for row, item in enumerate(self._rv_page_items()):
+                if item.task_id == task_id:
+                    self._rv_table.selectRow(row)
+                    self._rv_on_row_changed()
+                    return
 
         def _rv_adjust_boxes(self):
             item = self._rv_current_item()
@@ -2137,6 +2404,7 @@ def gui_main():
             if item.task_id not in self._rv_checked:
                 self._rv_checked.add(item.task_id)
             self._rv_render()
+            self._rv_select_task(item.task_id)
             if not chosen:
                 QMessageBox.information(self, "提示",
                                         "该任务未勾选任何框，认可时会跳过。")
@@ -2401,6 +2669,7 @@ def gui_main():
         win = CTTSWindow()
         win.show()
         app.exec()
+        return win
     except Exception:
         import traceback
         traceback.print_exc()

@@ -178,14 +178,16 @@ GUI 包含七个 Tab：
 3. **训练并导出** — 以 `weights/yolo26n.pt` 为基座微调，导出 `best.onnx` 并做加载自检。
 4. **API 预标注** — 只处理未标注任务，分批写入 Label Studio predictions；
    同一版本标签默认跳过，勾选「覆盖」才会重写。
-5. **人工复核** — 在 ⑦ 复核页按批次处理：可整批全选、逐任务勾选，或点「调整选中框…」
-   只保留部分预测框；认可后写成正式 annotation。也可直接跳转 Label Studio 修改。
+5. **人工复核** — 在 ⑦ 复核页左侧按批列出任务，右侧直接预览图片与预测框：
+   可整批全选、逐任务勾选，或点「调整选中框…」/ 直接点击预览框只保留部分框；
+   认可后写成正式 annotation。图片按需从 Label Studio 下载并缓存，右上角可跳转 LS 修改。
 
 产物固定落在 `runs/prelabel/<run_id>/`（dataset、train、model、report.json、run.log），
 版本标签形如 `ctts-prelabel:v1@480`，可在「仅预标注」时复用历史模型。
 
 > 复核页默认只列出 `ctts-prelabel*` 预测、默认只看未标注任务；每条任务会先重新校验
 > 是否已被他人标注，避免并发重复。认可操作只创建 annotation，不删除原 prediction。
+> 预览图从 `task.image` 下载，命中缓存不重复请求；图片加载失败不影响任务勾选与认可。
 > 原「④ 复核」分组中的抽样 CSV / 待复核统计仍保留在 ③ 预标注页。
 
 ## Label Studio 集成
