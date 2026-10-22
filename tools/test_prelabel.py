@@ -287,5 +287,47 @@ class TestBuildDataset(unittest.TestCase):
             self.assertTrue(content.startswith("0 "))
 
 
+class TrainArgsTest(unittest.TestCase):
+    """高级训练参数：默认值、合并、托管项与 JSON/--set 校验。"""
+
+    def test_default_train_args_shape(self):
+        args = P.default_train_args("cpu")
+        self.assertEqual(args["batch"], 8)
+        self.assertEqual(args["workers"], 2)
+        self.assertFalse(args["amp"])
+        self.assertEqual(args["imgsz"], 480)
+
+    def test_build_train_args_merges_and_ignores_managed(self):
+        base = {"epochs": 10, "device": "cpu"}
+        args, ignored = P.build_train_args(
+            base, {"lr0": 0.001, "epochs": 20, "data": "x"}, "cpu")
+        self.assertEqual(args["epochs"], 20)
+        self.assertEqual(args["lr0"], 0.001)
+        self.assertEqual(args["device"], "cpu")
+        self.assertEqual(ignored, ["data"])
+
+    def test_parse_json_text_validation(self):
+        from train_args import OverrideError, parse_json_text
+        with self.assertRaises(OverrideError):
+            parse_json_text("[1, 2]")
+        with self.assertRaises(OverrideError):
+            parse_json_text('{"augment": {"h": 1}}')
+
+        parsed, ignored = parse_json_text(
+            '{"lr0": 0.01, "mosaic": 0.0, "name": "x"}')
+        self.assertEqual(parsed, {"lr0": 0.01, "mosaic": 0.0})
+        self.assertEqual(ignored, ["name"])
+
+    def test_parse_set_values(self):
+        from train_args import parse_set
+        args, ignored = parse_set(
+            ["lr0=0.002", "cos_lr=false", "degrees=10", "project=runs/x"])
+        self.assertAlmostEqual(args["lr0"], 0.002)
+        self.assertIs(args["cos_lr"], False)
+        self.assertEqual(args["degrees"], 10)
+        self.assertNotIn("project", args)
+        self.assertEqual(ignored, ["project"])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -44,6 +44,13 @@ from label_studio_auth import (
     get_client,
     to_dict,
 )
+from train_args import (
+    MANAGED_KEYS as MANAGED_TRAIN_KEYS,
+    OverrideError,
+    normalize as normalize_train_overrides,
+    parse_json_text,
+    parse_set,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -156,6 +163,7 @@ class TrainResult:
     metrics: dict
     onnx: Path | None = None
     manifest: dict = field(default_factory=dict)
+    args: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -843,6 +851,39 @@ def _resolve_device(device: str) -> tuple[str, bool]:
     return device, gpu
 
 
+def default_train_args(device: str = "auto") -> dict:
+    """train_micro 的完整默认训练参数（GUI「载入默认参数」/ CLI 使用）。"""
+    dev, gpu = _resolve_device(device)
+    return {
+        "epochs": 150,
+        "imgsz": 480,
+        "freeze": 8,
+        "batch": 16 if gpu else 8,
+        "device": dev,
+        "workers": 8 if gpu else 2,
+        "amp": gpu,
+        "cos_lr": True,
+        "patience": 20,
+        "verbose": False,
+        "seed": 0,
+    }
+
+
+def build_train_args(
+    base: dict | None = None,
+    overrides: dict | None = None,
+    device: str = "auto",
+) -> tuple[dict, list[str]]:
+    """默认训练参数 + 高级覆盖；返回 (参数, 被忽略的托管项)。"""
+    if base is None:
+        base = default_train_args(device)
+    clean, ignored = (normalize_train_overrides(overrides)
+                      if overrides else ({}, []))
+    args = dict(base)
+    args.update(clean)
+    return args, ignored
+
+
 def _resolve_base_weights(base_weights: str) -> str:
     """本地权重不存在时退回文件名，交给 ultralytics 自动下载。"""
     path = Path(base_weights)
@@ -862,12 +903,13 @@ def train_micro(
     freeze: int = 8,
     device: str = "auto",
     batch: int | None = None,
+    train_overrides: dict | None = None,
     run_dir: str | None = None,
     on_event=None,
     should_stop: Callable[[], bool] | None = None,
     log: Callable[[str], None] | None = None,
 ) -> TrainResult:
-    """在微数据集上微调 nano 模型。"""
+    """在微数据集上微调 nano 模型；train_overrides 可覆盖任意训练参数。"""
     from ultralytics import YOLO
 
     data_yaml = dataset.root / "data.yaml"
@@ -882,6 +924,26 @@ def train_micro(
     batch_size = batch or (16 if gpu else 8)
     workers = 8 if gpu else 2
     amp = gpu
+
+    base_args = {
+        "epochs": epochs,
+        "imgsz": imgsz,
+        "freeze": freeze,
+        "batch": batch_size,
+        "device": dev,
+        "workers": workers,
+        "amp": amp,
+        "cos_lr": True,
+        "patience": 20,
+        "verbose": False,
+        "seed": 0,
+    }
+    train_args, ignored = build_train_args(base_args, train_overrides, device)
+    if ignored and log:
+        log(f"⚠ 高级参数中的托管项已忽略: {', '.join(ignored)}")
+    epochs = int(train_args["epochs"])
+    imgsz = int(train_args["imgsz"])
+    batch_size = int(train_args["batch"])
     _emit(on_event, "train", "start",
           f"训练 {Path(base_weights).name}（{'GPU' if gpu else 'CPU'}，batch {batch_size}）")
 
@@ -905,20 +967,10 @@ def train_micro(
     def do_train():
         return model.train(
             data=str(data_yaml),
-            epochs=epochs,
-            imgsz=imgsz,
-            freeze=freeze,
-            batch=batch_size,
-            device=dev,
-            workers=workers,
-            amp=amp,
-            cos_lr=True,
-            patience=20,
-            verbose=False,
             project=str(run_root / "train"),
             name="exp",
             exist_ok=True,
-            seed=0,
+            **train_args,
         )
 
     try:
@@ -928,6 +980,7 @@ def train_micro(
             raise
         state["attempt"] += 1
         batch_size = max(4, batch_size // 2)
+        train_args["batch"] = batch_size
         if log:
             log(f"⚠ 显存不足，batch 降为 {batch_size} 重试一次…")
         _emit(on_event, "train", "progress",
@@ -960,7 +1013,8 @@ def train_micro(
         if log:
             log(f"⚠ 验证集评估失败（不影响权重）: {e}")
 
-    result = TrainResult(run_dir=run_root, best_pt=best, metrics=metrics)
+    result = TrainResult(run_dir=run_root, best_pt=best, metrics=metrics,
+                         args=dict(train_args))
     _emit(on_event, "train", "done",
           f"训练完成：mAP50 {metrics.get('mAP50', 0):.2f}", 1.0)
     return result
@@ -1370,6 +1424,7 @@ def run_pipeline(
     reuse_model: str | None = None,
     skip_train: bool = False,
     images_dir: str | None = None,
+    train_overrides: dict | None = None,
     on_event=None,
     should_stop: Callable[[], bool] | None = None,
     log: Callable[[str], None] | None = None,
@@ -1419,25 +1474,26 @@ def run_pipeline(
         current_stage = "train"
         train_result = train_micro(
             dataset, base_weights=base_weights, epochs=epochs, imgsz=imgsz,
-            freeze=freeze, device=device, run_dir=str(run_dir),
-            on_event=on_event, should_stop=should_stop,
+            freeze=freeze, device=device, train_overrides=train_overrides,
+            run_dir=str(run_dir), on_event=on_event, should_stop=should_stop,
             log=log)
         report["train"] = train_result.to_dict()
+        effective_imgsz = int(train_result.args.get("imgsz", imgsz))
 
         current_stage = "export"
-        export_onnx(train_result, imgsz=imgsz, on_event=on_event, log=log)
+        export_onnx(train_result, imgsz=effective_imgsz, on_event=on_event, log=log)
         report["train"]["onnx"] = str(train_result.onnx)
 
         manifest = _write_manifest(
             train_result, version=version, run_id=run_id, base=base_weights,
-            imgsz=imgsz, dataset=dataset, ls_project=project_id,
+            imgsz=effective_imgsz, dataset=dataset, ls_project=project_id,
             marginal=assessment.verdict == "marginal")
         report["manifest"] = manifest
 
         current_stage = "prelabel"
         stats = prelabel_project(
             project_id, model=str(train_result.onnx), tag=manifest["tag"],
-            conf=conf, iou=iou, imgsz=imgsz, device=device,
+            conf=conf, iou=iou, imgsz=effective_imgsz, device=device,
             images_dir=images_dir,
             on_event=on_event, should_stop=should_stop, log=log)
         report["prelabel"] = stats.to_dict()
@@ -1475,6 +1531,14 @@ def _print_assessment(a: Assessment) -> None:
         print(f"\n建议: {a.suggestion}")
 
 
+def add_train_override_args(parser: argparse.ArgumentParser) -> None:
+    """给 train/run 子命令加高级训练参数入口。"""
+    parser.add_argument("--train-json", default=None,
+                        help='JSON 对象，覆盖任意训练参数，如 {"lr0": 0.001}')
+    parser.add_argument("--train-set", action="append", default=[],
+                        metavar="KEY=VALUE", help="单参数覆盖，可重复；值按 JSON 解析")
+
+
 def main():
     conn = argparse.ArgumentParser(add_help=False)
     add_connection_args(conn)
@@ -1501,6 +1565,7 @@ def main():
     p_train.add_argument("--epochs", type=int, default=150)
     p_train.add_argument("--imgsz", type=int, default=480)
     p_train.add_argument("--device", default="auto")
+    add_train_override_args(p_train)
 
     p_predict = sub.add_parser("predict", help="预标注项目未标注任务", parents=[conn])
     p_predict.add_argument("-p", "--project", type=int, required=True)
@@ -1523,8 +1588,22 @@ def main():
     p_run.add_argument("--images-dir", default=None)
     p_run.add_argument("--skip-train", action="store_true")
     p_run.add_argument("--model", default=None, help="复用模型（配合 --skip-train）")
+    add_train_override_args(p_run)
 
     args = parser.parse_args()
+    try:
+        train_overrides: dict = {}
+        if getattr(args, "train_json", None):
+            train_overrides, ignored = parse_json_text(args.train_json)
+            if ignored:
+                print(f"⚠ 托管项已忽略: {', '.join(ignored)}")
+        set_over, ignored = parse_set(getattr(args, "train_set", None))
+        train_overrides.update(set_over)
+        if ignored:
+            print(f"⚠ 托管项已忽略: {', '.join(ignored)}")
+    except OverrideError as exc:
+        print(f"❌ {exc}")
+        sys.exit(2)
     client = client_from_args(args)
 
     def log(msg: str) -> None:
@@ -1559,8 +1638,10 @@ def main():
                                skipped=0, failures=[])
             result = train_micro(info, base_weights=args.base, epochs=args.epochs,
                                  imgsz=args.imgsz, device=args.device,
+                                 train_overrides=train_overrides,
                                  run_dir=str(root.parent), log=log, on_event=on_event)
-            onnx = export_onnx(result, imgsz=args.imgsz, log=log, on_event=on_event)
+            onnx = export_onnx(result, imgsz=int(result.args.get("imgsz", args.imgsz)),
+                               log=log, on_event=on_event)
             print(f"best.pt: {result.best_pt}\nonnx: {onnx}")
 
         elif args.command == "predict":
@@ -1575,7 +1656,8 @@ def main():
             run_pipeline(args.project, base_weights=args.base, epochs=args.epochs,
                          imgsz=args.imgsz, conf=args.conf, iou=args.iou,
                          images_dir=args.images_dir, skip_train=args.skip_train,
-                         reuse_model=args.model, log=log, on_event=on_event)
+                         reuse_model=args.model, train_overrides=train_overrides,
+                         log=log, on_event=on_event)
 
     except KeyboardInterrupt:
         print("\n⚠ 已中断（已完成阶段保留）")

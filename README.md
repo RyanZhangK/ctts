@@ -154,7 +154,7 @@ GUI 包含六个 Tab：
 - **🏷️ 标注管理** — Label Studio 项目与任务管理；上传逐张显示进度，项目列表展示已标注数/进度并每 15s 自动刷新
 - **🎯 预标注** — 评估数据 → 训练小模型 → API 预标注 → 复核
 - **🗂️ 数据集划分** — 已标注数据划分为 train/val
-- **🚀 训练** — YOLO 训练参数配置与启动
+- **🚀 训练** — YOLO 训练参数配置、高级参数调试与启动
 - **🔍 推理** — 实时检测窗口启动
 
 ## 小模型预标注
@@ -253,10 +253,32 @@ python ctts.py detect --video test.mp4 -w weights/best.pt
 
 ## 自定义训练参数
 
-编辑 `tools/yolo_train.py` 修改训练配置，或在 GUI 训练 Tab 中调整参数后启动。
+训练默认值集中在 `tools/yolo_train.py` 的 `DEFAULT_TRAIN_ARGS`；预标注微调的默认值由
+`tools/prelabel.py` 的 `default_train_args()` 生成。两处都支持「基础字段 + 高级 JSON」双层覆盖：
 
-预标注流水线的训练超参（imgsz、epochs、freeze、device、conf/iou）在 GUI「预标注」Tab 中可调；
-CLI 子命令与参数见 `python prelabel.py --help`（`ctts.py prelabel ...` 会把参数原样转发）。
+- **GUI**：⑤ 训练 和 ③ 预标注 的「高级设置」文本框可粘贴 JSON 对象，点「载入默认参数」
+  会填入当前全部可调项；留空即使用默认值。
+- **CLI**：`yolo_train.py` 支持 `--json`、`--set KEY=VALUE`、`--print-defaults`、`--dry-run`；
+  `prelabel.py train/run` 支持 `--train-json`、`--train-set`。
+
+优先级为 **默认值 → GUI 基础字段 / CLI 基础参数 → 高级 JSON**，高级项最后生效。
+`data`、`project`、`name`、`exist_ok` 属于程序托管的结构性参数，写在高级 JSON 中会被忽略。
+
+```bash
+# 列出全部训练参数
+python yolo_train.py --print-defaults
+
+# 只打印最终参数，不启动训练（调试用）
+python yolo_train.py --dry-run --set lr0=0.001 --set cos_lr=false \
+  --json '{"mosaic": 0.0, "mixup": 0.1}'
+
+# 预标注微调时覆盖任意 ultralytics 训练参数
+python prelabel.py train --data runs/prelabel/demo/dataset \
+  --train-set lr0=0.001 --train-json '{"copy_paste": 0.1, "dropout": 0.1}'
+```
+
+GUI 训练页的基础字段（weights/data/epochs/batch/imgsz/device）仍按原方式生效；
+高级 JSON 可覆盖它们中的任意项，也可传入文件里未列出的 ultralytics 参数，便于逐个调试。
 
 ## 贡献
 

@@ -21,6 +21,7 @@ GUI 模式:
 """
 
 import argparse
+import json
 import os
 import sys
 import threading
@@ -61,7 +62,9 @@ def cli_main():
         "ls_args", nargs=argparse.REMAINDER)
 
     # ---- train ----
-    p_train = sub.add_parser("train", help="YOLO 训练（使用 yolo_train.py 硬编码配置）")
+    p_train = sub.add_parser("train", help="YOLO 训练（可透传 yolo_train.py 的高级参数）")
+    p_train.add_argument("args", nargs=argparse.REMAINDER,
+                         help="传递给 yolo_train 的参数，如 --set lr0=0.001")
 
     # ---- detect ----
     p_detect = sub.add_parser("detect", help="YOLO 推理")
@@ -72,45 +75,54 @@ def cli_main():
     p_prelabel.add_argument("args", nargs=argparse.REMAINDER,
                             help="传递给 prelabel 的参数")
 
-    args = parser.parse_args()
+    args, _unknown = parser.parse_known_args()
+    raw = sys.argv[1:]
 
     if args.gui:
         gui_main()
         return
 
-    if args.module is None:
+    if not raw:
         parser.print_help()
         return
 
-    # ---- 数据准备模块 ----
-    if args.module == "data":
-        extra = getattr(args, "args", [])
+    # 手动分发：原样保留顺序转发给子模块，避免 argparse 打乱
+    # `--set lr0=0.001` 这类透传参数。
+    module, rest = raw[0], raw[1:]
+    if rest and rest[0] == "--":
+        rest = rest[1:]
+
+    if module == "data":
+        action = rest[0] if rest else ""
         _forward_to_module({
             "build": "dataset_build",
             "split": "split_dataset",
-        }, args.action, parser, extra_args=extra)
+        }, action, parser, extra_args=rest[1:])
 
-    # ---- Label Studio 模块 ----
-    elif args.module == "label":
+    elif module == "label":
+        action = rest[0] if rest else ""
         _forward_to_module({
             "project": "label_studio_project",
             "data": "label_studio_data",
             "auth": "label_studio_auth",
-        }, args.action, parser, extra_args=getattr(args, "ls_args", []))
+        }, action, parser, extra_args=rest[1:])
 
-    # ---- 训练模块 ----
-    elif args.module == "train":
-        print("提示: CLI 训练使用 yolo_train.py 硬编码配置。")
-        print("      如需自定义参数，请使用 GUI 模式: python ctts.py --gui")
-        _forward_yolo_train()
+    elif module == "train":
+        if rest:
+            _forward_module("yolo_train", rest)
+        else:
+            print("提示: 未传参数时使用 yolo_train.py 的默认配置；")
+            print("      自定义参数示例: python ctts.py train --set lr0=0.001")
+            _forward_yolo_train()
 
-    # ---- 推理模块 ----
-    elif args.module == "detect":
-        _forward_detect(args.args if hasattr(args, "args") else [])
+    elif module == "detect":
+        _forward_detect(rest)
 
-    # ---- 预标注模块 ----
-    elif args.module == "prelabel":
-        _forward_module("prelabel", getattr(args, "args", []))
+    elif module == "prelabel":
+        _forward_module("prelabel", rest)
+
+    else:
+        parser.print_help()
 
 
 def _forward_to_module(mapping: dict, action: str, parser, extra_args: list | None = None):
@@ -172,6 +184,7 @@ def gui_main():
             QGroupBox, QFormLayout, QSpinBox, QProgressBar,
             QMainWindow, QFileDialog, QTextEdit, QComboBox,
             QCheckBox, QDoubleSpinBox, QSlider, QScrollArea,
+            QPlainTextEdit,
         )
     except ModuleNotFoundError:
         venv_dir = os.path.expanduser(os.environ.get("CTTS_VENV", "~/.cache/ctts-venv"))
@@ -1059,6 +1072,10 @@ def gui_main():
             params.addStretch()
             fl2.addRow(params)
 
+            adv, self._pre_adv = self._build_advanced_group(
+                "高级设置（覆盖任意训练参数）", self._pre_advanced_defaults)
+            fl2.addRow(adv)
+
             arow = QHBoxLayout()
             self._pre_artifact = QLabel("上次产物: —")
             _set_status(self._pre_artifact, "上次产物: —", "idle")
@@ -1170,7 +1187,7 @@ def gui_main():
                     self._pre_weights_btn, self._pre_imgsz, self._pre_epochs,
                     self._pre_freeze, self._pre_device, self._pre_model,
                     self._pre_model_btn, self._pre_conf, self._pre_iou,
-                    self._pre_skip, self._pre_overwrite]
+                    self._pre_skip, self._pre_overwrite, self._pre_adv]
 
         def _pre_update_connection(self):
             ok = self.client is not None
@@ -1289,6 +1306,10 @@ def gui_main():
             return ["auto", "cpu", "0"][self._pre_device.currentIndex()]
 
         def _pre_start_pipeline(self):
+            train_overrides = self._advanced_overrides(
+                self._pre_adv, "预标注训练高级参数")
+            if train_overrides is None:
+                return
             project_id = self._pre_project.value()
             weights = self._pre_weights.text().strip() or "weights/yolo26n.pt"
             epochs = self._pre_epochs.value()
@@ -1303,7 +1324,8 @@ def gui_main():
                 return run_pipeline(
                     project_id, base_weights=weights, epochs=epochs,
                     imgsz=imgsz, conf=conf, iou=iou, freeze=freeze,
-                    device=device, on_event=on_event,
+                    device=device, train_overrides=train_overrides,
+                    on_event=on_event,
                     should_stop=self._pre_label_cancel.is_set, log=log)
 
             self._pre_start_worker(fn, "pipeline")
@@ -1615,6 +1637,10 @@ def gui_main():
             self._train_device.addItems(["0", "cpu"])
             fl.addRow("设备:", self._train_device)
 
+            adv, self._train_adv = self._build_advanced_group(
+                "高级设置（覆盖任意训练参数）", self._train_advanced_defaults)
+            fl.addRow(adv)
+
             btn_train = QPushButton("开始训练")
             btn_train.setStyleSheet("font-size: 14px; padding: 8px;")
             btn_train.clicked.connect(self._run_train)
@@ -1635,22 +1661,28 @@ def gui_main():
                 QMessageBox.warning(self, "提示", f"权重文件不存在: {weights}")
                 return
 
+            overrides = self._advanced_overrides(self._train_adv, "训练高级参数")
+            if overrides is None:
+                return
+
             self._start_task(
-                lambda log: self._do_train(log, weights, data, epochs, batch, imgsz, device),
+                lambda log: self._do_train(
+                    log, weights, data, epochs, batch, imgsz, device, overrides),
                 "YOLO 训练",
             )
 
-        def _do_train(self, log, weights, data, epochs, batch, imgsz, device):
+        def _do_train(self, log, weights, data, epochs, batch, imgsz, device,
+                      overrides):
             import io
-            from ultralytics import YOLO
+            from yolo_train import run_training
             log(f"🚀 启动训练: {weights}\n")
-            model = YOLO(weights)
             buf = io.StringIO()
             old = sys.stdout
             sys.stdout = buf
             try:
-                model.train(data=data, epochs=epochs, imgsz=imgsz,
-                            batch=batch, device=device, amp=True)
+                run_training(weights, data=data, epochs=epochs, batch=batch,
+                             imgsz=imgsz, device=device, overrides=overrides,
+                             log=log)
             except Exception as e:
                 log(f"训练出错: {e}")
             finally:
@@ -1831,6 +1863,67 @@ def gui_main():
             path = QFileDialog.getExistingDirectory(self, "选择目录")
             if path:
                 target.setText(path)
+
+        # ---- 高级训练参数 ----
+        def _build_advanced_group(self, title, defaults_loader):
+            grp = QGroupBox(title)
+            v = QVBoxLayout(grp)
+            hint = QLabel(
+                "JSON 对象，覆盖同名训练参数；data / project / name / exist_ok "
+                "由程序托管。留空表示使用默认值。")
+            hint.setWordWrap(True)
+            hint.setStyleSheet("color: #6b7280;")
+            v.addWidget(hint)
+
+            edit = QPlainTextEdit()
+            edit.setPlaceholderText(
+                '例如 {"lr0": 0.001, "cos_lr": false, "mosaic": 0.0}')
+            edit.setMaximumHeight(120)
+            v.addWidget(edit)
+
+            row = QHBoxLayout()
+            btn_defaults = QPushButton("载入默认参数")
+            btn_defaults.clicked.connect(
+                lambda: self._load_advanced_defaults(edit, defaults_loader))
+            btn_clear = QPushButton("清空")
+            btn_clear.clicked.connect(edit.clear)
+            row.addWidget(btn_defaults)
+            row.addWidget(btn_clear)
+            row.addStretch()
+            v.addLayout(row)
+            return grp, edit
+
+        def _load_advanced_defaults(self, edit, loader):
+            try:
+                data = loader()
+            except Exception as e:
+                QMessageBox.warning(self, "提示", f"无法读取默认参数: {e}")
+                return
+            edit.setPlainText(json.dumps(data, ensure_ascii=False, indent=2))
+
+        def _advanced_overrides(self, edit, label):
+            from train_args import OverrideError, parse_json_text
+            try:
+                overrides, ignored = parse_json_text(edit.toPlainText())
+            except OverrideError as e:
+                QMessageBox.warning(self, "高级参数错误", f"{label}：{e}")
+                return None
+            if ignored:
+                self._log_append(
+                    f"⚠ {label}中的托管项已忽略: {', '.join(ignored)}")
+            return overrides
+
+        def _train_advanced_defaults(self):
+            from train_args import MANAGED_KEYS
+            from yolo_train import DEFAULT_TRAIN_ARGS
+            return {k: v for k, v in DEFAULT_TRAIN_ARGS.items()
+                    if k not in MANAGED_KEYS}
+
+        def _pre_advanced_defaults(self):
+            from prelabel import default_train_args
+            from train_args import MANAGED_KEYS
+            defaults = default_train_args(self._pre_device_value())
+            return {k: v for k, v in defaults.items() if k not in MANAGED_KEYS}
 
         def closeEvent(self, event):
             for w in self._workers:
