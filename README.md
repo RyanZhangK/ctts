@@ -60,6 +60,8 @@ ctts/
 │   ├── label_studio_main.py     # LS CLI 入口
 │   ├── prelabel.py        # ★ 小模型预标注流水线
 │   ├── test_prelabel.py   # 预标注离线单测（无需 LS/GPU）
+│   ├── review.py          # 预标注复核：扫描批次、批量认可为 annotation
+│   ├── test_review.py     # 复核逻辑离线单测
 │   ├── pyproject.toml     # 依赖声明
 │   └── .gitignore
 ├── docs/                  # 设计文档
@@ -148,18 +150,23 @@ source ~/.cache/ctts-venv/bin/activate
 python ctts.py --gui
 ```
 
-GUI 包含六个 Tab：
+GUI 包含七个 Tab：
 
 - **📦 数据准备** — 视频抽帧、质量过滤、数据集划分
 - **🏷️ 标注管理** — Label Studio 项目与任务管理；上传逐张显示进度，项目列表展示已标注数/进度并每 15s 自动刷新
 - **🎯 预标注** — 评估数据 → 训练小模型 → API 预标注 → 复核
 - **🗂️ 数据集划分** — 已标注数据划分为 train/val
-- **🚀 训练** — YOLO 训练参数配置与启动
+- **🚀 训练** — YOLO 训练参数配置、高级参数调试与启动
 - **🔍 推理** — 实时检测窗口启动
+- **🧐 复核** — 按批次查看预标注结果，勾选任务/调整预测框后批量认可为人工标注
 
 ## 小模型预标注
 
 人工只标一小部分，用 nano 模型先标剩下的，再人工复核，可显著减少重复劳动。
+
+③ 与 ② 共用同一个 Label Studio 连接：先在 ② 填写地址/Token 并点「连接 / 重连」，
+③ 才会启用；修改地址或 Token 后旧连接立即失效，需要重新连接。③ 的项目 ID 跟随
+② 当前选中的项目，远程项目列表里不存在该 ID 时会自动切到第一个项目。
 
 流程（一个 Tab 内完成，也可用 `ctts.py prelabel`）：
 
@@ -171,12 +178,17 @@ GUI 包含六个 Tab：
 3. **训练并导出** — 以 `weights/yolo26n.pt` 为基座微调，导出 `best.onnx` 并做加载自检。
 4. **API 预标注** — 只处理未标注任务，分批写入 Label Studio predictions；
    同一版本标签默认跳过，勾选「覆盖」才会重写。
-5. **人工复核** — 在 Label Studio 中确认/修正预测并提交；工具不会自动接受预测。
+5. **人工复核** — 在 ⑦ 复核页左侧按批列出任务，右侧直接预览图片与预测框：
+   可整批全选、逐任务勾选，或点「调整选中框…」/ 直接点击预览框只保留部分框；
+   认可后写成正式 annotation。图片按需从 Label Studio 下载并缓存，右上角可跳转 LS 修改。
 
 产物固定落在 `runs/prelabel/<run_id>/`（dataset、train、model、report.json、run.log），
 版本标签形如 `ctts-prelabel:v1@480`，可在「仅预标注」时复用历史模型。
 
-> 复核抽样 CSV 与待复核数量统计在「④ 复核」分组；预测框不会被自动确认为标注。
+> 复核页默认只列出 `ctts-prelabel*` 预测、默认只看未标注任务；每条任务会先重新校验
+> 是否已被他人标注，避免并发重复。认可操作只创建 annotation，不删除原 prediction。
+> 预览图从 `task.image` 下载，命中缓存不重复请求；图片加载失败不影响任务勾选与认可。
+> 原「④ 复核」分组中的抽样 CSV / 待复核统计仍保留在 ③ 预标注页。
 
 ## Label Studio 集成
 
@@ -253,10 +265,32 @@ python ctts.py detect --video test.mp4 -w weights/best.pt
 
 ## 自定义训练参数
 
-编辑 `tools/yolo_train.py` 修改训练配置，或在 GUI 训练 Tab 中调整参数后启动。
+训练默认值集中在 `tools/yolo_train.py` 的 `DEFAULT_TRAIN_ARGS`；预标注微调的默认值由
+`tools/prelabel.py` 的 `default_train_args()` 生成。两处都支持「基础字段 + 高级 JSON」双层覆盖：
 
-预标注流水线的训练超参（imgsz、epochs、freeze、device、conf/iou）在 GUI「预标注」Tab 中可调；
-CLI 子命令与参数见 `python prelabel.py --help`（`ctts.py prelabel ...` 会把参数原样转发）。
+- **GUI**：⑤ 训练 和 ③ 预标注 的「高级设置」文本框可粘贴 JSON 对象，点「载入默认参数」
+  会填入当前全部可调项；留空即使用默认值。
+- **CLI**：`yolo_train.py` 支持 `--json`、`--set KEY=VALUE`、`--print-defaults`、`--dry-run`；
+  `prelabel.py train/run` 支持 `--train-json`、`--train-set`。
+
+优先级为 **默认值 → GUI 基础字段 / CLI 基础参数 → 高级 JSON**，高级项最后生效。
+`data`、`project`、`name`、`exist_ok` 属于程序托管的结构性参数，写在高级 JSON 中会被忽略。
+
+```bash
+# 列出全部训练参数
+python yolo_train.py --print-defaults
+
+# 只打印最终参数，不启动训练（调试用）
+python yolo_train.py --dry-run --set lr0=0.001 --set cos_lr=false \
+  --json '{"mosaic": 0.0, "mixup": 0.1}'
+
+# 预标注微调时覆盖任意 ultralytics 训练参数
+python prelabel.py train --data runs/prelabel/demo/dataset \
+  --train-set lr0=0.001 --train-json '{"copy_paste": 0.1, "dropout": 0.1}'
+```
+
+GUI 训练页的基础字段（weights/data/epochs/batch/imgsz/device）仍按原方式生效；
+高级 JSON 可覆盖它们中的任意项，也可传入文件里未列出的 ultralytics 参数，便于逐个调试。
 
 ## 贡献
 

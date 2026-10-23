@@ -21,11 +21,23 @@ GUI 模式:
 """
 
 import argparse
+import json
 import os
 import sys
 import threading
 import webbrowser
 from pathlib import Path
+
+_REVIEW_MODULE = None
+
+
+def _load_review_module():
+    """在 GUI 主线程懒加载 review，避免在 QThread 内首次导入 SDK。"""
+    global _REVIEW_MODULE
+    if _REVIEW_MODULE is None:
+        import review as module
+        _REVIEW_MODULE = module
+    return _REVIEW_MODULE
 
 
 # ---------------------------------------------------------------------------
@@ -61,7 +73,9 @@ def cli_main():
         "ls_args", nargs=argparse.REMAINDER)
 
     # ---- train ----
-    p_train = sub.add_parser("train", help="YOLO 训练（使用 yolo_train.py 硬编码配置）")
+    p_train = sub.add_parser("train", help="YOLO 训练（可透传 yolo_train.py 的高级参数）")
+    p_train.add_argument("args", nargs=argparse.REMAINDER,
+                         help="传递给 yolo_train 的参数，如 --set lr0=0.001")
 
     # ---- detect ----
     p_detect = sub.add_parser("detect", help="YOLO 推理")
@@ -72,45 +86,54 @@ def cli_main():
     p_prelabel.add_argument("args", nargs=argparse.REMAINDER,
                             help="传递给 prelabel 的参数")
 
-    args = parser.parse_args()
+    args, _unknown = parser.parse_known_args()
+    raw = sys.argv[1:]
 
     if args.gui:
         gui_main()
         return
 
-    if args.module is None:
+    if not raw:
         parser.print_help()
         return
 
-    # ---- 数据准备模块 ----
-    if args.module == "data":
-        extra = getattr(args, "args", [])
+    # 手动分发：原样保留顺序转发给子模块，避免 argparse 打乱
+    # `--set lr0=0.001` 这类透传参数。
+    module, rest = raw[0], raw[1:]
+    if rest and rest[0] == "--":
+        rest = rest[1:]
+
+    if module == "data":
+        action = rest[0] if rest else ""
         _forward_to_module({
             "build": "dataset_build",
             "split": "split_dataset",
-        }, args.action, parser, extra_args=extra)
+        }, action, parser, extra_args=rest[1:])
 
-    # ---- Label Studio 模块 ----
-    elif args.module == "label":
+    elif module == "label":
+        action = rest[0] if rest else ""
         _forward_to_module({
             "project": "label_studio_project",
             "data": "label_studio_data",
             "auth": "label_studio_auth",
-        }, args.action, parser, extra_args=getattr(args, "ls_args", []))
+        }, action, parser, extra_args=rest[1:])
 
-    # ---- 训练模块 ----
-    elif args.module == "train":
-        print("提示: CLI 训练使用 yolo_train.py 硬编码配置。")
-        print("      如需自定义参数，请使用 GUI 模式: python ctts.py --gui")
-        _forward_yolo_train()
+    elif module == "train":
+        if rest:
+            _forward_module("yolo_train", rest)
+        else:
+            print("提示: 未传参数时使用 yolo_train.py 的默认配置；")
+            print("      自定义参数示例: python ctts.py train --set lr0=0.001")
+            _forward_yolo_train()
 
-    # ---- 推理模块 ----
-    elif args.module == "detect":
-        _forward_detect(args.args if hasattr(args, "args") else [])
+    elif module == "detect":
+        _forward_detect(rest)
 
-    # ---- 预标注模块 ----
-    elif args.module == "prelabel":
-        _forward_module("prelabel", getattr(args, "args", []))
+    elif module == "prelabel":
+        _forward_module("prelabel", rest)
+
+    else:
+        parser.print_help()
 
 
 def _forward_to_module(mapping: dict, action: str, parser, extra_args: list | None = None):
@@ -163,8 +186,8 @@ def gui_main():
         sys.path.insert(0, tools_dir)
 
     try:
-        from PySide6.QtCore import Qt, QThread, QTimer, Signal
-        from PySide6.QtGui import QFont
+        from PySide6.QtCore import Qt, QThread, QTimer, Signal, QRectF, QPointF
+        from PySide6.QtGui import QFont, QPixmap, QPainter, QColor, QPen
         from PySide6.QtWidgets import (
             QApplication, QWidget, QVBoxLayout, QHBoxLayout,
             QTabWidget, QPushButton, QLabel, QLineEdit,
@@ -172,6 +195,7 @@ def gui_main():
             QGroupBox, QFormLayout, QSpinBox, QProgressBar,
             QMainWindow, QFileDialog, QTextEdit, QComboBox,
             QCheckBox, QDoubleSpinBox, QSlider, QScrollArea,
+            QPlainTextEdit, QDialog, QDialogButtonBox, QSplitter,
         )
     except ModuleNotFoundError:
         venv_dir = os.path.expanduser(os.environ.get("CTTS_VENV", "~/.cache/ctts-venv"))
@@ -276,6 +300,135 @@ def gui_main():
             self.log_line.emit(msg)
 
 
+
+    # ---- ReviewCanvas / ReviewImageWorker（⑦ 复核页图片预览） ----
+    class ReviewCanvas(QWidget):
+        """绘制任务图片和预测框；点击框可切换是否认可。"""
+
+        boxClicked = Signal(int)
+
+        def __init__(self):
+            super().__init__()
+            self.setMinimumSize(420, 320)
+            self._pix = None
+            self._boxes = []
+            self._selected: set[int] = set()
+            self._msg = "选择任务查看预测框预览"
+            self._task_id = None
+
+        def set_message(self, msg: str):
+            self._pix = None
+            self._boxes = []
+            self._selected = set()
+            self._msg = msg
+            self.update()
+
+        def set_frame(self, pixmap, boxes, selected, task_id):
+            self._pix = pixmap
+            self._boxes = list(boxes or [])
+            self._selected = set(selected)
+            self._task_id = task_id
+            self.update()
+
+        def set_selected(self, selected):
+            self._selected = set(selected)
+            self.update()
+
+        def _layout(self):
+            pw = self._pix.width() if self._pix is not None else 1
+            ph = self._pix.height() if self._pix is not None else 1
+            vw, vh = self.width(), self.height()
+            scale = min(vw / max(pw, 1), vh / max(ph, 1))
+            ow, oh = int(pw * scale), int(ph * scale)
+            return (vw - ow) // 2, (vh - oh) // 2, ow, oh, scale
+
+        def paintEvent(self, _event):
+            p = QPainter(self)
+            p.fillRect(self.rect(), QColor("#f5f5f5"))
+            p.setRenderHint(QPainter.RenderHint.Antialiasing)
+            if self._pix is None or self._pix.isNull():
+                p.setPen(QColor("#888"))
+                p.drawText(self.rect(), Qt.AlignCenter, self._msg)
+                return
+            ox, oy, ow, oh, _ = self._layout()
+            target = QRectF(ox, oy, ow, oh)
+            p.drawPixmap(target, self._pix, QRectF(self._pix.rect()))
+            p.setFont(QFont("Microsoft YaHei UI", 8))
+            for i, res in enumerate(self._boxes):
+                val = res.get("value", {}) if isinstance(res, dict) else {}
+                try:
+                    x = float(val.get("x", 0) or 0)
+                    y = float(val.get("y", 0) or 0)
+                    bw = float(val.get("width", 0) or 0)
+                    bh = float(val.get("height", 0) or 0)
+                except (TypeError, ValueError):
+                    continue
+                rect = QRectF(ox + x / 100 * ow, oy + y / 100 * oh,
+                              bw / 100 * ow, bh / 100 * oh)
+                sel = i in self._selected
+                pen = QPen(QColor("#16a34a") if sel else QColor("#ef4444"),
+                           2.2 if sel else 1.2)
+                if not sel:
+                    pen.setStyle(Qt.DashLine)
+                p.setPen(pen)
+                p.drawRect(rect)
+                labels = val.get("rectanglelabels") or []
+                text = f"{i + 1}. {'/'.join(str(v) for v in labels) or '?'}"
+                score = res.get("score") if isinstance(res, dict) else None
+                if score is not None:
+                    try:
+                        text += f" {float(score):.2f}"
+                    except (TypeError, ValueError):
+                        pass
+                fm = p.fontMetrics()
+                tw = fm.horizontalAdvance(text) + 6
+                th = fm.height() + 2
+                ty = max(oy, rect.top() - th)
+                p.fillRect(QRectF(rect.left(), ty, tw, th),
+                           QColor(22, 163, 74, 200) if sel else QColor(120, 120, 120, 170))
+                p.setPen(QColor("white"))
+                p.drawText(QRectF(rect.left() + 3, ty, tw, th),
+                           Qt.AlignVCenter | Qt.AlignLeft, text)
+
+        def mousePressEvent(self, event):
+            if self._pix is None or self._pix.isNull():
+                return
+            ox, oy, ow, oh, _ = self._layout()
+            pos = event.position()
+            for i in range(len(self._boxes) - 1, -1, -1):
+                res = self._boxes[i]
+                val = res.get("value", {}) if isinstance(res, dict) else {}
+                try:
+                    x = float(val.get("x", 0) or 0)
+                    y = float(val.get("y", 0) or 0)
+                    bw = float(val.get("width", 0) or 0)
+                    bh = float(val.get("height", 0) or 0)
+                except (TypeError, ValueError):
+                    continue
+                rect = QRectF(ox + x / 100 * ow, oy + y / 100 * oh,
+                              bw / 100 * ow, bh / 100 * oh)
+                if rect.contains(pos):
+                    self.boxClicked.emit(i)
+                    return
+
+    class ReviewImageWorker(QThread):
+        loaded = Signal(int, bytes)
+        failed = Signal(int, str)
+
+        def __init__(self, task_id, client, review_mod):
+            super().__init__()
+            self.task_id = task_id
+            self.client = client
+            self.review_mod = review_mod
+
+        def run(self):
+            try:
+                url = self.review_mod.task_image_url(self.client, self.task_id)
+                data = self.review_mod.fetch_image_bytes(self.client, url)
+                self.loaded.emit(self.task_id, data)
+            except Exception as e:
+                self.failed.emit(self.task_id, str(e))
+
     # ---- 主窗口 ----
     class CTTSWindow(QMainWindow):
         def __init__(self):
@@ -284,12 +437,6 @@ def gui_main():
             self.resize(960, 700)
             self.client = None
             self._workers = []
-
-            try:
-                self.client = get_client()
-            except Exception:
-                self.client = None
-
             self._build_ui()
 
         def _build_ui(self):
@@ -313,6 +460,7 @@ def gui_main():
             tabs.addTab(self._build_split_tab(), "④ 数据集划分")
             tabs.addTab(self._build_train_tab(), "⑤ 训练")
             tabs.addTab(self._build_detect_tab(), "⑥ 推理")
+            tabs.addTab(self._build_review_tab(), "⑦ 复核")
             layout.addWidget(tabs)
 
             # 共享日志输出
@@ -328,6 +476,13 @@ def gui_main():
             self._pre_project.valueChanged.connect(self._pre_on_project_changed)
             self._pre_refresh_models()
             self._pre_update_connection()
+            self._tabs.currentChanged.connect(self._on_tab_changed)
+
+        def _on_tab_changed(self, index: int):
+            if index == 2:
+                self._pre_update_connection()
+            elif index == 6:
+                self._rv_auto_load()
 
         # ============================================================
         # ① 数据准备 Tab
@@ -507,6 +662,7 @@ def gui_main():
             cl = QFormLayout(grp_conn)
             self._ls_url = QLineEdit(resolve_base_url())
             self._ls_url.setPlaceholderText(DEFAULT_BASE_URL)
+            self._ls_url.textEdited.connect(self._ls_invalidate_connection)
             cl.addRow("地址:", self._ls_url)
             self._ls_token = QLineEdit()
             _echo = getattr(QLineEdit, "Password", None)
@@ -518,6 +674,7 @@ def gui_main():
             env_tok = os.environ.get("LABEL_STUDIO_TOKEN", "")
             if env_tok:
                 self._ls_token.setText(env_tok)
+            self._ls_token.textEdited.connect(self._ls_invalidate_connection)
             cl.addRow("Token:", self._ls_token)
             conn_btn_row = QHBoxLayout()
             btn_connect = QPushButton("连接 / 重连")
@@ -526,8 +683,7 @@ def gui_main():
             self._ls_conn_status = QLabel()
             _set_status(
                 self._ls_conn_status,
-                f"已连接: {self.client.base_url}" if self.client else "未连接",
-                "ok" if self.client else "warn")
+                "未连接（填写地址/Token 后点「连接 / 重连」）", "warn")
             conn_btn_row.addWidget(self._ls_conn_status)
             conn_btn_row.addStretch()
             cl.addRow(conn_btn_row)
@@ -636,10 +792,19 @@ def gui_main():
             self._ls_timer.setInterval(15000)
             self._ls_timer.timeout.connect(self._ls_auto_tick)
 
-            # 已自动连上则刷新；否则等用户点「连接 / 重连」
-            if self.client is not None:
-                self._ls_refresh_projects()
             return w
+
+        def _ls_invalidate_connection(self, *_args):
+            """地址 / Token 被手动修改后，旧连接失效，③ 同步回到未连接。"""
+            if self.client is None:
+                return
+            self.client = None
+            self._ls_connected_ok = False
+            self._ls_timer.stop()
+            _set_status(self._ls_conn_status,
+                        "连接配置已修改，请点「连接 / 重连」", "warn")
+            self._pre_update_connection()
+            self._rv_invalidate()
 
         def _ls_reconnect(self):
             """按界面上的地址 / Token 连接本机或远程 Label Studio。"""
@@ -658,6 +823,7 @@ def gui_main():
                 # 连接状态同步到 ③ 预标注（否则仍显示“请先连接”）
                 self._pre_refresh_models()
                 self._pre_update_connection()
+                self._rv_invalidate()
             except Exception as e:
                 self.client = None
                 self._ls_connected_ok = False
@@ -724,15 +890,23 @@ def gui_main():
                 table.setItem(i, 4, item)
             table.blockSignals(False)
             table.clearSelection()
-            if select_id is not None:
+            ids = [int(p["id"]) for p in projects]
+            target = select_id
+            if target is None and ids and self._pre_project.value() not in ids:
+                # 远程项目列表里没有 ③ 当前项目 ID：同步到第一个项目，
+                # 避免 ③ 还停留在启动时的本地默认值 10。
+                target = ids[0]
+            if target is not None:
                 # 静默恢复选中行：不触发 selectionChanged，避免自动刷新覆盖
                 # 用户手动输入的任务/上传项目 ID。
                 table.blockSignals(True)
                 for row in range(table.rowCount()):
-                    if table.item(row, 0).text() == str(select_id):
+                    if table.item(row, 0).text() == str(target):
                         table.selectRow(row)
                         break
                 table.blockSignals(False)
+                if select_id is None and target != self._pre_project.value():
+                    self._ls_task_project.setValue(target)
             if self._ls_auto_cb.isChecked() and not self._ls_timer.isActive():
                 self._ls_timer.start()
             from datetime import datetime as _dt
@@ -984,6 +1158,9 @@ def gui_main():
             self._pre_conn_hint = QLabel("请先在 ② 标注管理连接 Label Studio")
             _set_status(self._pre_conn_hint, self._pre_conn_hint.text(), "warn")
             layout.addWidget(self._pre_conn_hint)
+            self._pre_conn_info = QLabel("连接: 未连接")
+            _set_status(self._pre_conn_info, "连接: 未连接", "idle")
+            layout.addWidget(self._pre_conn_info)
 
             # ---- ① 数据就绪 ----
             grp = QGroupBox("① 数据就绪")
@@ -1059,6 +1236,10 @@ def gui_main():
             params.addStretch()
             fl2.addRow(params)
 
+            adv, self._pre_adv = self._build_advanced_group(
+                "高级设置（覆盖任意训练参数）", self._pre_advanced_defaults)
+            fl2.addRow(adv)
+
             arow = QHBoxLayout()
             self._pre_artifact = QLabel("上次产物: —")
             _set_status(self._pre_artifact, "上次产物: —", "idle")
@@ -1076,6 +1257,7 @@ def gui_main():
             mrow = QHBoxLayout()
             self._pre_model = QComboBox()
             self._pre_model.addItem("自动：最新 ONNX", "")
+            self._pre_model.currentIndexChanged.connect(self._pre_on_model_changed)
             mrow.addWidget(self._pre_model)
             self._pre_model_btn = QPushButton("选择…")
             self._pre_model_btn.clicked.connect(self._pre_choose_model)
@@ -1170,11 +1352,16 @@ def gui_main():
                     self._pre_weights_btn, self._pre_imgsz, self._pre_epochs,
                     self._pre_freeze, self._pre_device, self._pre_model,
                     self._pre_model_btn, self._pre_conf, self._pre_iou,
-                    self._pre_skip, self._pre_overwrite]
+                    self._pre_skip, self._pre_overwrite, self._pre_adv]
 
         def _pre_update_connection(self):
             ok = self.client is not None
             self._pre_conn_hint.setVisible(not ok)
+            if ok:
+                _set_status(self._pre_conn_info,
+                            f"连接: {self.client.base_url}（来自 ② 标注管理）", "ok")
+            else:
+                _set_status(self._pre_conn_info, "连接: 未连接", "idle")
             self._pre_apply_enabled()
 
         def _pre_apply_enabled(self):
@@ -1245,6 +1432,21 @@ def gui_main():
                 _set_status(self._pre_status, suggestion,
                             "warn" if verdict == "marginal" else "err")
 
+        def _pre_on_model_changed(self, _index=None):
+            """选中带 manifest 的模型时，自动采用其导出 imgsz。"""
+            model = self._pre_model.currentData()
+            if not model:
+                return
+            try:
+                import json
+                data = json.loads(
+                    (Path(model).parent / "manifest.json").read_text())
+                imgsz = int(data.get("imgsz", 0))
+            except (OSError, ValueError, TypeError):
+                return
+            if self._pre_imgsz.minimum() <= imgsz <= self._pre_imgsz.maximum():
+                self._pre_imgsz.setValue(imgsz)
+
         def _pre_refresh_models(self):
             try:
                 from prelabel import RUN_ROOT
@@ -1289,6 +1491,10 @@ def gui_main():
             return ["auto", "cpu", "0"][self._pre_device.currentIndex()]
 
         def _pre_start_pipeline(self):
+            train_overrides = self._advanced_overrides(
+                self._pre_adv, "预标注训练高级参数")
+            if train_overrides is None:
+                return
             project_id = self._pre_project.value()
             weights = self._pre_weights.text().strip() or "weights/yolo26n.pt"
             epochs = self._pre_epochs.value()
@@ -1303,7 +1509,8 @@ def gui_main():
                 return run_pipeline(
                     project_id, base_weights=weights, epochs=epochs,
                     imgsz=imgsz, conf=conf, iou=iou, freeze=freeze,
-                    device=device, on_event=on_event,
+                    device=device, train_overrides=train_overrides,
+                    client=self.client, on_event=on_event,
                     should_stop=self._pre_label_cancel.is_set, log=log)
 
             self._pre_start_worker(fn, "pipeline")
@@ -1332,7 +1539,7 @@ def gui_main():
                 tag = tag_from_manifest(model, imgsz) or make_tag("manual", imgsz)
                 return prelabel_project(
                     project_id, model=model, tag=tag, conf=conf, iou=iou,
-                    imgsz=imgsz, skip=not self._pre_overwrite.isChecked(),
+                    imgsz=imgsz,
                     overwrite=self._pre_overwrite.isChecked(),
                     device=self._pre_device_value(), on_event=on_event,
                     should_stop=self._pre_label_cancel.is_set,
@@ -1615,6 +1822,10 @@ def gui_main():
             self._train_device.addItems(["0", "cpu"])
             fl.addRow("设备:", self._train_device)
 
+            adv, self._train_adv = self._build_advanced_group(
+                "高级设置（覆盖任意训练参数）", self._train_advanced_defaults)
+            fl.addRow(adv)
+
             btn_train = QPushButton("开始训练")
             btn_train.setStyleSheet("font-size: 14px; padding: 8px;")
             btn_train.clicked.connect(self._run_train)
@@ -1635,22 +1846,28 @@ def gui_main():
                 QMessageBox.warning(self, "提示", f"权重文件不存在: {weights}")
                 return
 
+            overrides = self._advanced_overrides(self._train_adv, "训练高级参数")
+            if overrides is None:
+                return
+
             self._start_task(
-                lambda log: self._do_train(log, weights, data, epochs, batch, imgsz, device),
+                lambda log: self._do_train(
+                    log, weights, data, epochs, batch, imgsz, device, overrides),
                 "YOLO 训练",
             )
 
-        def _do_train(self, log, weights, data, epochs, batch, imgsz, device):
+        def _do_train(self, log, weights, data, epochs, batch, imgsz, device,
+                      overrides):
             import io
-            from ultralytics import YOLO
+            from yolo_train import run_training
             log(f"🚀 启动训练: {weights}\n")
-            model = YOLO(weights)
             buf = io.StringIO()
             old = sys.stdout
             sys.stdout = buf
             try:
-                model.train(data=data, epochs=epochs, imgsz=imgsz,
-                            batch=batch, device=device, amp=True)
+                run_training(weights, data=data, epochs=epochs, batch=batch,
+                             imgsz=imgsz, device=device, overrides=overrides,
+                             log=log)
             except Exception as e:
                 log(f"训练出错: {e}")
             finally:
@@ -1731,6 +1948,545 @@ def gui_main():
                 stderr = proc.stderr.read().decode(errors="replace")
                 QMessageBox.critical(self, "推理启动失败",
                     f"detect.py 异常退出 (code={ret})\n\n{stderr[-500:]}")
+
+        # ============================================================
+        # ⑦ 预标注复核 Tab
+        # ============================================================
+        def _build_review_tab(self) -> QWidget:
+            w = QWidget()
+            layout = QVBoxLayout(w)
+
+            grp = QGroupBox("加载预标注结果")
+            fl = QFormLayout(grp)
+            row = QHBoxLayout()
+            self._rv_project = QSpinBox()
+            self._rv_project.setRange(0, 99999999)
+            self._rv_project.setPrefix("项目 ")
+            row.addWidget(self._rv_project)
+            self._rv_version = QComboBox()
+            self._rv_version.addItem("全部版本", "")
+            row.addWidget(QLabel("版本:"))
+            row.addWidget(self._rv_version)
+            self._rv_only_unlabeled = QCheckBox("仅未标注")
+            self._rv_only_unlabeled.setChecked(True)
+            row.addWidget(self._rv_only_unlabeled)
+            self._rv_batch_size = QSpinBox()
+            self._rv_batch_size.setRange(1, 200)
+            self._rv_batch_size.setValue(20)
+            self._rv_batch_size.setSuffix(" 条/批")
+            row.addWidget(QLabel("每批:"))
+            row.addWidget(self._rv_batch_size)
+            self._rv_load_btn = QPushButton("加载")
+            self._rv_load_btn.setStyleSheet(PRIMARY_BTN_QSS)
+            self._rv_load_btn.clicked.connect(self._rv_load)
+            row.addWidget(self._rv_load_btn)
+            row.addStretch()
+            fl.addRow(row)
+            self._rv_status = QLabel("未加载：先连接 ②，选择项目后点“加载”")
+            _set_status(self._rv_status, self._rv_status.text(), "idle")
+            fl.addRow(self._rv_status)
+            layout.addWidget(grp)
+
+            grp2 = QGroupBox("批次复核")
+            bl = QVBoxLayout(grp2)
+            bar = QHBoxLayout()
+            self._rv_batch_info = QLabel("—")
+            bar.addWidget(self._rv_batch_info)
+            bar.addStretch()
+            self._rv_prev = QPushButton("上一批")
+            self._rv_prev.clicked.connect(lambda: self._rv_page(-1))
+            self._rv_next = QPushButton("下一批")
+            self._rv_next.clicked.connect(lambda: self._rv_page(1))
+            bar.addWidget(self._rv_prev)
+            bar.addWidget(self._rv_next)
+            bl.addLayout(bar)
+
+            self._rv_table = QTableWidget(0, 5)
+            self._rv_table.setHorizontalHeaderLabels(["认可", "任务", "预测框", "版本", "状态"])
+            self._rv_table.verticalHeader().setVisible(False)
+            self._rv_table.setSelectionBehavior(QTableWidget.SelectRows)
+            self._rv_table.setEditTriggers(QTableWidget.NoEditTriggers)
+            self._rv_table.horizontalHeader().setStretchLastSection(True)
+            self._rv_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+            self._rv_table.itemChanged.connect(self._rv_item_changed)
+            self._rv_table.currentCellChanged.connect(lambda *_: self._rv_on_row_changed())
+
+            # 右侧图片预览：显示任务图片和预测框，点击框切换是否认可。
+            self._rv_canvas = ReviewCanvas()
+            self._rv_canvas.boxClicked.connect(self._rv_toggle_box)
+            self._rv_preview_info = QLabel("选择任务查看预测框预览")
+            self._rv_preview_info.setStyleSheet(MUTED_QSS)
+            preview = QWidget()
+            pl = QVBoxLayout(preview)
+            pl.setContentsMargins(0, 0, 0, 0)
+            pl.addWidget(self._rv_canvas, 1)
+            pl.addWidget(self._rv_preview_info)
+            split = QSplitter(Qt.Horizontal)
+            split.addWidget(self._rv_table)
+            split.addWidget(preview)
+            split.setStretchFactor(0, 3)
+            split.setStretchFactor(1, 4)
+            split.setSizes([460, 520])
+            bl.addWidget(split, 1)
+
+            ops = QHBoxLayout()
+            for text, slot in (("全选本批", self._rv_select_page),
+                               ("全不选", self._rv_select_none),
+                               ("调整选中框…", self._rv_adjust_boxes),
+                               ("在 LS 打开", self._rv_open_task)):
+                btn = QPushButton(text)
+                btn.clicked.connect(slot)
+                ops.addWidget(btn)
+            ops.addStretch()
+            self._rv_accept_btn = QPushButton("认可选中")
+            self._rv_accept_btn.setStyleSheet(PRIMARY_BTN_QSS)
+            self._rv_accept_btn.clicked.connect(self._rv_accept)
+            ops.addWidget(self._rv_accept_btn)
+            self._rv_accept_batch_btn = QPushButton("认可本批全部")
+            self._rv_accept_batch_btn.setStyleSheet(PRIMARY_BTN_QSS)
+            self._rv_accept_batch_btn.clicked.connect(self._rv_accept_batch)
+            ops.addWidget(self._rv_accept_batch_btn)
+            bl.addLayout(ops)
+            hint = QLabel("勾选任务后点“认可选中”；点“认可本批全部”一键认可当前批次；"
+                          "默认认可该任务全部预测框，可先用“调整选中框…”只保留部分框。")
+            hint.setStyleSheet(MUTED_QSS)
+            bl.addWidget(hint)
+            layout.addWidget(grp2)
+
+            # 状态
+            self._rv_items = []
+            self._rv_checked: set[int] = set()
+            self._rv_box_sel: dict[int, list[int]] = {}
+            self._rv_pix_cache: dict[int, QPixmap] = {}
+            self._rv_preview_pending = None
+            self._rv_batch = 0
+            self._rv_loaded_project = -1
+            self._rv_busy = False
+
+            self._rv_project.valueChanged.connect(self._rv_project_changed)
+            self._rv_batch_size.valueChanged.connect(lambda _: self._rv_render())
+            self._rv_version.currentIndexChanged.connect(lambda _: self._rv_invalidate())
+            self._rv_only_unlabeled.toggled.connect(lambda _: self._rv_invalidate())
+            self._ls_task_project.valueChanged.connect(self._rv_project.setValue)
+            return w
+
+        def _rv_client(self):
+            return self.client if self.client is not None else None
+
+        def _rv_invalidate(self):
+            if self._rv_busy:
+                return
+            self._rv_loaded_project = -1
+            self._rv_items = []
+            self._rv_checked.clear()
+            self._rv_box_sel.clear()
+            self._rv_batch = 0
+            self._rv_table.setRowCount(0)
+            self._rv_batch_info.setText("—")
+            self._rv_pix_cache.clear()
+            self._rv_preview_pending = None
+            self._rv_img_task = None
+            self._rv_canvas.set_message("选择任务查看预测框预览")
+            self._rv_preview_info.setText("选择任务查看预测框预览")
+            self._rv_accept_btn.setEnabled(False)
+            _set_status(self._rv_status, "筛选条件已变化，点击“加载”", "warn")
+
+        def _rv_project_changed(self, pid: int):
+            if pid != self._rv_loaded_project:
+                self._rv_invalidate()
+
+        def _rv_auto_load(self):
+            if self._rv_client() is None or self._rv_busy:
+                return
+            pid = self._ls_task_project.value()
+            if pid <= 0:
+                return
+            if pid != self._rv_project.value():
+                self._rv_project.setValue(pid)
+            if pid != self._rv_loaded_project:
+                self._rv_load()
+
+        def _rv_load(self):
+            self._rv_preview_pending = None
+            if self._rv_client() is None:
+                QMessageBox.warning(self, "提示", "请先在 ② 标注管理连接 Label Studio。")
+                return
+            if self._rv_busy:
+                return
+            pid = self._rv_project.value()
+            if pid <= 0:
+                QMessageBox.warning(self, "提示", "请填写项目 ID。")
+                return
+            version = self._rv_version.currentData() or ""
+            only_unlabeled = self._rv_only_unlabeled.isChecked()
+            self._rv_busy = True
+            self._rv_load_btn.setEnabled(False)
+            _set_status(self._rv_status, "加载中…", "warn")
+
+            def fn():
+                from review import scan_review
+                return scan_review(pid, version=version,
+                                   only_unlabeled=only_unlabeled,
+                                   client=self.client)
+
+            def done(items):
+                self._rv_busy = False
+                self._rv_load_btn.setEnabled(True)
+                self._rv_loaded_project = pid
+                self._rv_items = list(items)
+                self._rv_checked.clear()
+                self._rv_box_sel.clear()
+                self._rv_batch = 0
+                versions = sorted({i.version for i in items})
+                current = self._rv_version.currentData() or ""
+                self._rv_version.blockSignals(True)
+                self._rv_version.clear()
+                self._rv_version.addItem("全部版本", "")
+                for v in versions:
+                    self._rv_version.addItem(v, v)
+                idx = self._rv_version.findData(current)
+                self._rv_version.setCurrentIndex(idx if idx >= 0 else 0)
+                self._rv_version.blockSignals(False)
+                self._rv_render()
+                total = len(items)
+                if total:
+                    _set_status(self._rv_status,
+                                f"已加载 {total} 条待复核（项目 {pid}）", "ok")
+                else:
+                    _set_status(self._rv_status,
+                                f"项目 {pid} 没有待复核的预标注结果", "idle")
+
+            def failed(_e):
+                self._rv_busy = False
+                self._rv_load_btn.setEnabled(True)
+                _set_status(self._rv_status, "加载失败", "err")
+
+            self._run_task(fn, done, "加载复核数据", on_error=failed)
+
+        def _rv_pages(self) -> int:
+            size = self._rv_batch_size.value()
+            return max(1, (len(self._rv_items) + size - 1) // size)
+
+        def _rv_page(self, delta: int):
+            target = self._rv_batch + delta
+            if 0 <= target < self._rv_pages():
+                self._rv_batch = target
+                self._rv_render()
+
+        def _rv_page_items(self):
+            size = self._rv_batch_size.value()
+            start = self._rv_batch * size
+            return self._rv_items[start:start + size]
+
+        def _rv_render(self):
+            if not hasattr(self, "_rv_table"):
+                return
+            pag = self._rv_pages()
+            self._rv_batch = min(self._rv_batch, pag - 1)
+            items = self._rv_page_items()
+            self._rv_table.blockSignals(True)
+            self._rv_table.setRowCount(len(items))
+            for row, item in enumerate(items):
+                chk = QTableWidgetItem()
+                chk.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable)
+                chk.setCheckState(Qt.Checked if item.task_id in self._rv_checked else Qt.Unchecked)
+                chk.setData(Qt.UserRole, item.task_id)
+                self._rv_table.setItem(row, 0, chk)
+                self._rv_table.setItem(row, 1, QTableWidgetItem(str(item.task_id)))
+                self._rv_table.setItem(row, 2, QTableWidgetItem(str(item.boxes)))
+                self._rv_table.setItem(row, 3, QTableWidgetItem(item.version))
+                state = "已标注" if item.is_labeled else "未标注"
+                self._rv_table.setItem(row, 4, QTableWidgetItem(state))
+            self._rv_table.blockSignals(False)
+            if self._rv_items:
+                self._rv_batch_info.setText(
+                    f"第 {self._rv_batch + 1}/{pag} 批 · 本批 {len(items)} 条 · "
+                    f"已勾选 {len(self._rv_checked)} 条 · 共 {len(self._rv_items)} 条")
+            else:
+                self._rv_batch_info.setText("—")
+            if items:
+                self._rv_table.blockSignals(True)
+                self._rv_table.selectRow(0)
+                self._rv_table.blockSignals(False)
+                self._rv_on_row_changed()
+            else:
+                self._rv_canvas.set_message("本批没有任务")
+                self._rv_preview_info.setText("—")
+            self._rv_accept_btn.setEnabled(bool(self._rv_checked) and not self._rv_busy)
+
+        def _rv_item_changed(self, item: QTableWidgetItem):
+            if item.column() != 0:
+                return
+            tid = item.data(Qt.UserRole)
+            if tid is None:
+                return
+            if item.checkState() == Qt.Checked:
+                self._rv_checked.add(int(tid))
+            else:
+                self._rv_checked.discard(int(tid))
+            self._rv_accept_btn.setEnabled(bool(self._rv_checked) and not self._rv_busy)
+            if self._rv_items:
+                self._rv_batch_info.setText(
+                    f"第 {self._rv_batch + 1}/{self._rv_pages()} 批 · 本批 "
+                    f"{len(self._rv_page_items())} 条 · 已勾选 {len(self._rv_checked)} 条 · "
+                    f"共 {len(self._rv_items)} 条")
+
+        def _rv_select_page(self):
+            for item in self._rv_page_items():
+                self._rv_checked.add(item.task_id)
+            self._rv_render()
+
+        def _rv_select_none(self):
+            self._rv_checked.clear()
+            self._rv_render()
+
+        def _rv_current_item(self):
+            row = self._rv_table.currentRow()
+            if row < 0:
+                return None
+            item = self._rv_table.item(row, 1)
+            if item is None:
+                return None
+            tid = int(item.text())
+            for it in self._rv_items:
+                if it.task_id == tid:
+                    return it
+            return None
+
+        def _rv_forget_worker(self, w):
+            if w in self._workers:
+                self._workers.remove(w)
+
+        def _rv_on_row_changed(self):
+            item = self._rv_current_item()
+            if item is None:
+                if hasattr(self, "_rv_canvas"):
+                    self._rv_canvas.set_message("选择任务查看预测框预览")
+                return
+            if getattr(self, "_rv_preview_pending", None) == item.task_id:
+                return
+            self._rv_img_task = item.task_id
+            pix = self._rv_pix_cache.get(item.task_id)
+            if pix is not None:
+                self._rv_show_canvas(item, pix)
+                return
+            if self._rv_client() is None:
+                self._rv_canvas.set_message("未连接 Label Studio")
+                return
+            self._rv_canvas.set_message(f"加载任务 {item.task_id} 的图片…")
+            self._rv_preview_info.setText(
+                f"任务 {item.task_id} · {item.boxes} 个预测框 · 加载图片…")
+            try:
+                review_mod = _load_review_module()
+            except Exception as e:
+                self._rv_canvas.set_message(f"预览模块不可用：{e}")
+                return
+            self._rv_preview_pending = item.task_id
+            w = ReviewImageWorker(item.task_id, self.client, review_mod)
+            w.loaded.connect(self._rv_preview_loaded)
+            w.failed.connect(self._rv_preview_failed)
+            w.finished.connect(lambda w=w: self._rv_forget_worker(w))
+            self._workers.append(w)
+            w.start()
+
+        def _rv_show_canvas(self, item, pix):
+            sel = set(self._rv_box_sel.get(item.task_id, range(item.boxes)))
+            self._rv_canvas.set_frame(pix, item.result, sel, item.task_id)
+            self._rv_preview_info.setText(
+                f"任务 {item.task_id} · {item.boxes} 个预测框 · 已选 {len(sel)} 个"
+                "（点击框可切换是否认可）")
+
+        def _rv_preview_loaded(self, task_id: int, data: bytes):
+            if getattr(self, "_rv_preview_pending", None) == task_id:
+                self._rv_preview_pending = None
+            pix = QPixmap()
+            if not pix.loadFromData(data):
+                if task_id == getattr(self, "_rv_img_task", None):
+                    self._rv_canvas.set_message("图片下载成功但无法解码")
+                return
+            self._rv_pix_cache[task_id] = pix
+            while len(self._rv_pix_cache) > 24:
+                self._rv_pix_cache.pop(next(iter(self._rv_pix_cache)))
+            item = self._rv_current_item()
+            if (item is not None and item.task_id == task_id
+                    and task_id == getattr(self, "_rv_img_task", None)):
+                self._rv_show_canvas(item, pix)
+
+        def _rv_preview_failed(self, task_id: int, msg: str):
+            if getattr(self, "_rv_preview_pending", None) == task_id:
+                self._rv_preview_pending = None
+            if task_id != getattr(self, "_rv_img_task", None):
+                return
+            self._rv_canvas.set_message(f"图片加载失败：{msg}")
+            self._rv_preview_info.setText(
+                f"任务 {task_id} · 图片加载失败；可点“在 LS 打开”查看")
+
+        def _rv_toggle_box(self, index: int):
+            item = self._rv_current_item()
+            if item is None or not (0 <= index < item.boxes):
+                return
+            sel = set(self._rv_box_sel.get(item.task_id, range(item.boxes)))
+            if index in sel:
+                sel.discard(index)
+            else:
+                sel.add(index)
+            self._rv_box_sel[item.task_id] = sorted(sel)
+            pix = self._rv_pix_cache.get(item.task_id)
+            if pix is not None:
+                self._rv_show_canvas(item, pix)
+            else:
+                self._rv_canvas.set_selected(sel)
+                self._rv_preview_info.setText(
+                    f"任务 {item.task_id} · {item.boxes} 个预测框 · 已选 {len(sel)} 个")
+
+        def _rv_select_task(self, task_id: int):
+            for row, item in enumerate(self._rv_page_items()):
+                if item.task_id == task_id:
+                    self._rv_table.selectRow(row)
+                    self._rv_on_row_changed()
+                    return
+
+        def _rv_adjust_boxes(self):
+            item = self._rv_current_item()
+            if item is None:
+                QMessageBox.information(self, "提示", "先在表格中选中一条任务。")
+                return
+            default = set(self._rv_box_sel.get(item.task_id, range(item.boxes)))
+            dlg = QDialog(self)
+            dlg.setWindowTitle(f"调整框 · 任务 {item.task_id}")
+            dlg.resize(640, 380)
+            lay = QVBoxLayout(dlg)
+            info = QLabel(f"预测版本 {item.version} · 共 {item.boxes} 个框；"
+                          "只保留勾选的框。")
+            lay.addWidget(info)
+            tbl = QTableWidget(len(item.result), 7)
+            tbl.setHorizontalHeaderLabels(["认可", "#", "类别", "置信度", "x", "y", "宽×高"])
+            tbl.verticalHeader().setVisible(False)
+            tbl.setEditTriggers(QTableWidget.NoEditTriggers)
+            tbl.horizontalHeader().setStretchLastSection(True)
+            for i, res in enumerate(item.result):
+                chk = QTableWidgetItem()
+                chk.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable)
+                chk.setCheckState(Qt.Checked if i in default else Qt.Unchecked)
+                chk.setData(Qt.UserRole, i)
+                tbl.setItem(i, 0, chk)
+                tbl.setItem(i, 1, QTableWidgetItem(str(i)))
+                val = res.get("value", {}) if isinstance(res, dict) else {}
+                labels = val.get("rectanglelabels") or []
+                tbl.setItem(i, 2, QTableWidgetItem("/".join(map(str, labels))))
+                score = res.get("score") if isinstance(res, dict) else None
+                tbl.setItem(i, 3, QTableWidgetItem("" if score is None else f"{float(score):.2f}"))
+                tbl.setItem(i, 4, QTableWidgetItem(f"{val.get('x', 0):.2f}"))
+                tbl.setItem(i, 5, QTableWidgetItem(f"{val.get('y', 0):.2f}"))
+                tbl.setItem(i, 6, QTableWidgetItem(
+                    f"{val.get('width', 0):.2f}% × {val.get('height', 0):.2f}%"))
+            lay.addWidget(tbl)
+            ops = QHBoxLayout()
+            all_btn = QPushButton("全选")
+            all_btn.clicked.connect(lambda: [tbl.item(i, 0).setCheckState(Qt.Checked)
+                                             for i in range(tbl.rowCount())])
+            none_btn = QPushButton("全不选")
+            none_btn.clicked.connect(lambda: [tbl.item(i, 0).setCheckState(Qt.Unchecked)
+                                              for i in range(tbl.rowCount())])
+            ops.addWidget(all_btn)
+            ops.addWidget(none_btn)
+            ops.addStretch()
+            lay.addLayout(ops)
+            buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+            buttons.accepted.connect(dlg.accept)
+            buttons.rejected.connect(dlg.reject)
+            lay.addWidget(buttons)
+            if dlg.exec() != QDialog.Accepted:
+                return
+            chosen = [i for i in range(tbl.rowCount())
+                      if tbl.item(i, 0).checkState() == Qt.Checked]
+            self._rv_box_sel[item.task_id] = chosen
+            if item.task_id not in self._rv_checked:
+                self._rv_checked.add(item.task_id)
+            self._rv_render()
+            self._rv_select_task(item.task_id)
+            if not chosen:
+                QMessageBox.information(self, "提示",
+                                        "该任务未勾选任何框，认可时会跳过。")
+
+        def _rv_open_task(self):
+            if self._rv_client() is None:
+                return
+            item = self._rv_current_item()
+            if item is None:
+                checked = [i for i in self._rv_items if i.task_id in self._rv_checked]
+                item = checked[0] if checked else None
+            if item is None:
+                QMessageBox.information(self, "提示", "先选中一条任务。")
+                return
+            base = str(self.client.base_url).rstrip("/")
+            pid = self._rv_project.value()
+            webbrowser.open(f"{base}/projects/{pid}/data?task={item.task_id}")
+
+        def _rv_accept_batch(self):
+            """勾选当前页全部任务并提交。"""
+            if not self._rv_items:
+                QMessageBox.information(self, "提示", "请先加载复核数据。")
+                return
+            self._rv_check_page(True)
+            self._rv_accept()
+
+        def _rv_accept(self):
+            if self._rv_client() is None or self._rv_busy:
+                return
+            chosen = [i for i in self._rv_items if i.task_id in self._rv_checked]
+            if not chosen:
+                QMessageBox.information(self, "提示", "没有勾选任何任务。")
+                return
+            if QMessageBox.question(
+                    self, "确认认可",
+                    f"将把 {len(chosen)} 条任务转为人工标注（只保留已选中的框）。\n"
+                    "认可后任务会变成“已标注”，不再出现在待复核列表。是否继续？",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No) != QMessageBox.Yes:
+                return
+            pid = self._rv_project.value()
+            selections = {it.task_id: self._rv_box_sel[it.task_id]
+                          for it in chosen if it.task_id in self._rv_box_sel}
+            self._rv_busy = True
+            self._rv_accept_btn.setEnabled(False)
+            self._rv_load_btn.setEnabled(False)
+            _set_status(self._rv_status, f"认可 {len(chosen)} 条…", "warn")
+
+            def fn():
+                from review import accept_items
+                return accept_items(pid, chosen, selections=selections,
+                                    client=self.client)
+
+            def done(stats):
+                self._rv_busy = False
+                accepted = set(stats.get("accepted_ids") or [])
+                self._rv_items = [i for i in self._rv_items if i.task_id not in accepted]
+                for tid in accepted:
+                    self._rv_checked.discard(tid)
+                    self._rv_box_sel.pop(tid, None)
+                self._rv_batch = min(self._rv_batch, self._rv_pages() - 1)
+                self._rv_render()
+                self._rv_load_btn.setEnabled(True)
+                _set_status(self._rv_status,
+                            f"认可 {stats.get('accepted', 0)} 条，跳过 "
+                            f"{stats.get('skipped', 0)}，失败 {stats.get('failed', 0)}",
+                            "ok" if not stats.get("failed") else "warn")
+                QMessageBox.information(
+                    self, "复核完成",
+                    f"认可 {stats.get('accepted', 0)} 条（{stats.get('boxes', 0)} 个框）\n"
+                    f"跳过 {stats.get('skipped', 0)}，失败 {stats.get('failed', 0)}")
+                if stats.get("errors"):
+                    self._log_append("❌ 部分任务认可失败：")
+                    for err in stats["errors"]:
+                        self._log_append(f"  任务 {err['task_id']}: {err['error']}")
+
+            def failed(_e):
+                self._rv_busy = False
+                self._rv_load_btn.setEnabled(True)
+                _set_status(self._rv_status, "认可失败", "err")
+
+            self._run_task(fn, done, "认可复核结果", on_error=failed)
 
         # ============================================================
         # 通用方法
@@ -1832,6 +2588,67 @@ def gui_main():
             if path:
                 target.setText(path)
 
+        # ---- 高级训练参数 ----
+        def _build_advanced_group(self, title, defaults_loader):
+            grp = QGroupBox(title)
+            v = QVBoxLayout(grp)
+            hint = QLabel(
+                "JSON 对象，覆盖同名训练参数；data / project / name / exist_ok "
+                "由程序托管。留空表示使用默认值。")
+            hint.setWordWrap(True)
+            hint.setStyleSheet("color: #6b7280;")
+            v.addWidget(hint)
+
+            edit = QPlainTextEdit()
+            edit.setPlaceholderText(
+                '例如 {"lr0": 0.001, "cos_lr": false, "mosaic": 0.0}')
+            edit.setMaximumHeight(120)
+            v.addWidget(edit)
+
+            row = QHBoxLayout()
+            btn_defaults = QPushButton("载入默认参数")
+            btn_defaults.clicked.connect(
+                lambda: self._load_advanced_defaults(edit, defaults_loader))
+            btn_clear = QPushButton("清空")
+            btn_clear.clicked.connect(edit.clear)
+            row.addWidget(btn_defaults)
+            row.addWidget(btn_clear)
+            row.addStretch()
+            v.addLayout(row)
+            return grp, edit
+
+        def _load_advanced_defaults(self, edit, loader):
+            try:
+                data = loader()
+            except Exception as e:
+                QMessageBox.warning(self, "提示", f"无法读取默认参数: {e}")
+                return
+            edit.setPlainText(json.dumps(data, ensure_ascii=False, indent=2))
+
+        def _advanced_overrides(self, edit, label):
+            from train_args import OverrideError, parse_json_text
+            try:
+                overrides, ignored = parse_json_text(edit.toPlainText())
+            except OverrideError as e:
+                QMessageBox.warning(self, "高级参数错误", f"{label}：{e}")
+                return None
+            if ignored:
+                self._log_append(
+                    f"⚠ {label}中的托管项已忽略: {', '.join(ignored)}")
+            return overrides
+
+        def _train_advanced_defaults(self):
+            from train_args import MANAGED_KEYS
+            from yolo_train import DEFAULT_TRAIN_ARGS
+            return {k: v for k, v in DEFAULT_TRAIN_ARGS.items()
+                    if k not in MANAGED_KEYS}
+
+        def _pre_advanced_defaults(self):
+            from prelabel import default_train_args
+            from train_args import MANAGED_KEYS
+            defaults = default_train_args(self._pre_device_value())
+            return {k: v for k, v in defaults.items() if k not in MANAGED_KEYS}
+
         def closeEvent(self, event):
             for w in self._workers:
                 w.quit()
@@ -1852,6 +2669,7 @@ def gui_main():
         win = CTTSWindow()
         win.show()
         app.exec()
+        return win
     except Exception:
         import traceback
         traceback.print_exc()
