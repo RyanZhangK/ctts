@@ -17,7 +17,7 @@ GUI 请使用:
 import argparse
 import sys
 
-from label_studio_auth import DEFAULT_TIMEOUT, add_connection_args
+from .label_studio_auth import DEFAULT_TIMEOUT, add_connection_args
 
 
 def cli_main():
@@ -99,11 +99,11 @@ def cli_main():
     sys.argv = [sys.argv[0]] + conn_flags + rest
 
     if args.module == "project":
-        from label_studio_project import main as m
+        from .label_studio_project import main as m
     elif args.module == "data":
-        from label_studio_data import main as m
+        from .label_studio_data import main as m
     elif args.module == "auth":
-        from label_studio_auth import main as m
+        from .label_studio_auth import main as m
     else:
         parser.print_help()
         return

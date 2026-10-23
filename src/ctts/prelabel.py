@@ -38,13 +38,13 @@ from urllib.parse import unquote, urlparse
 import httpx
 import numpy as np
 
-from label_studio_auth import (
+from .label_studio_auth import (
     add_connection_args,
     client_from_args,
     get_client,
     to_dict,
 )
-from train_args import (
+from .train_args import (
     MANAGED_KEYS as MANAGED_TRAIN_KEYS,
     OverrideError,
     normalize as normalize_train_overrides,
@@ -804,7 +804,7 @@ def build_micro_dataset(
     (root / "classes.txt").write_text("\n".join(cfg.labels) + "\n")
 
     # 复用现有划分逻辑，产物为 train/ val/ data.yaml
-    from split_dataset import split_dataset
+    from .split_dataset import split_dataset
 
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):

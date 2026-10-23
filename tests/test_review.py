@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import unittest
 
-import review
+from ctts import review
 
 
 def _box(label="object", score=0.9, x=10.0):

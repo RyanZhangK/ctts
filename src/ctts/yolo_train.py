@@ -13,7 +13,7 @@ from pathlib import Path
 
 from ultralytics.models.yolo import YOLO
 
-from train_args import (
+from .train_args import (
     MANAGED_KEYS,
     OverrideError,
     merged,
@@ -22,11 +22,14 @@ from train_args import (
     parse_set,
 )
 
-_PROJECT_ROOT = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+# 仓根：src/ctts/yolo_train.py → 上三级
+_PROJECT_ROOT = _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 # SOURCE_WEIGHT = _os.path.join(_PROJECT_ROOT, "weights", "yolo26s.pt")
-SOURCE_WEIGHT = "/home/ryanz/eDisk/nuedc/26/ctts/runs/detect/26钢珠/weights/best.pt"
+# 默认权重：仓内根目录 yolo26n.pt；可用 CTTS_WEIGHTS 或 CLI/GUI 覆盖
+SOURCE_WEIGHT = _os.environ.get("CTTS_WEIGHTS", _os.path.join(_PROJECT_ROOT, "yolo26n.pt"))
 # DATASET_DIR = _os.path.join(_PROJECT_ROOT, "dataset", "LabelData", "data.yaml")
-DATASET_DIR = "/home/ryanz/eDisk/nuedc/26/ctts/dataset/sLabelData/data.yaml"
+# 默认数据集描述文件；可用 CTTS_DATASET 或 CLI/GUI 覆盖
+DATASET_DIR = _os.environ.get("CTTS_DATASET", _os.path.join(_PROJECT_ROOT, "dataset", "LabelData", "data.yaml"))
 FREEZE_LAYERS = 8
 
 # 一份完整的可调参数清单：新增/调试参数时只改这里。

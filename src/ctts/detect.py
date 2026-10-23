@@ -3,19 +3,19 @@
 
 示例:
   # 摄像头（默认 /dev/video0）
-  python tools/detect.py
+  python -m ctts.detect
 
   # 指定摄像头
-  python tools/detect.py --cam 2
+  python -m ctts.detect --cam 2
 
   # 视频文件
-  python tools/detect.py --video test.mp4
+  python -m ctts.detect --video test.mp4
 
   # 指定权重 + 保存输出
-  python tools/detect.py --video test.mp4 -w weights/best.pt --save output.mp4
+  python -m ctts.detect --video test.mp4 -w weights/best.pt --save output.mp4
 
   # 调整阈值
-  python tools/detect.py --cam 0 --conf 0.3 --iou 0.6
+  python -m ctts.detect --cam 0 --conf 0.3 --iou 0.6
 """
 
 import argparse

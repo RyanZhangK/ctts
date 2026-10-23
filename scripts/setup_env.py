@@ -85,7 +85,7 @@ def _setup_console() -> None:
 
 def read_project() -> tuple[list[str], tuple[int, int]]:
     """读取 pyproject.toml 的依赖与最低 Python 版本。"""
-    pyproject = SCRIPT_DIR / "pyproject.toml"
+    pyproject = PROJECT_ROOT / "pyproject.toml"
     with pyproject.open("rb") as f:
         data = tomllib.load(f)
     project = data.get("project", {})

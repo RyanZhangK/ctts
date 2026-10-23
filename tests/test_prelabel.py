@@ -13,7 +13,7 @@ from types import SimpleNamespace
 
 import numpy as np
 
-import prelabel as P
+from ctts import prelabel as P
 
 
 CFG_XML_STB = (
@@ -360,7 +360,7 @@ class TrainArgsTest(unittest.TestCase):
         self.assertEqual(ignored, ["data"])
 
     def test_parse_json_text_validation(self):
-        from train_args import OverrideError, parse_json_text
+        from ctts.train_args import OverrideError, parse_json_text
         with self.assertRaises(OverrideError):
             parse_json_text("[1, 2]")
         with self.assertRaises(OverrideError):
@@ -372,7 +372,7 @@ class TrainArgsTest(unittest.TestCase):
         self.assertEqual(ignored, ["name"])
 
     def test_parse_set_values(self):
-        from train_args import parse_set
+        from ctts.train_args import parse_set
         args, ignored = parse_set(
             ["lr0=0.002", "cos_lr=false", "degrees=10", "project=runs/x"])
         self.assertAlmostEqual(args["lr0"], 0.002)

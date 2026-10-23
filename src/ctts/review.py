@@ -16,7 +16,7 @@ from urllib.parse import urlparse
 
 import httpx
 
-from label_studio_auth import get_client
+from .label_studio_auth import get_client
 
 TAG_PREFIX = "ctts-prelabel"
 
@@ -25,7 +25,7 @@ def _emit(on_event, stage: str, status: str, message: str,
           progress: float | None = None, visible: bool = True) -> None:
     if on_event is None:
         return
-    from prelabel import StageEvent
+    from .prelabel import StageEvent
 
     on_event(StageEvent(stage=stage, status=status, message=message,
                         progress=progress, visible=visible))

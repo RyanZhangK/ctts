@@ -16,7 +16,7 @@ import os
 from typing import Callable
 import sys
 
-from label_studio_auth import (
+from .label_studio_auth import (
     add_connection_args,
     client_from_args,
     get_client,

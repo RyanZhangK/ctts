@@ -28,6 +28,9 @@ import threading
 import webbrowser
 from pathlib import Path
 
+# 仓根：src/ctts/__main__.py → 上三级
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 _REVIEW_MODULE = None
 
 
@@ -35,7 +38,7 @@ def _load_review_module():
     """在 GUI 主线程懒加载 review，避免在 QThread 内首次导入 SDK。"""
     global _REVIEW_MODULE
     if _REVIEW_MODULE is None:
-        import review as module
+        from . import review as module
         _REVIEW_MODULE = module
     return _REVIEW_MODULE
 
@@ -147,20 +150,20 @@ def _forward_to_module(mapping: dict, action: str, parser, extra_args: list | No
 def _forward_module(mod_name: str, extra_args: list | None = None):
     """重建 sys.argv 并调用工具模块的 main()。"""
     # 重建 sys.argv: ctts.py data build ... → dataset_build.py ...
-    sys.argv = [mod_name + ".py"]
+    sys.argv = [mod_name]
     if extra_args:
         # 去掉 REMAINDER 捕获的 "--" 分隔符
         sys.argv += [a for a in extra_args if a != "--"]
 
     import importlib
-    mod = importlib.import_module(mod_name)
+    mod = importlib.import_module(f".{mod_name}", package=__package__)
     mod.main()
 
 
 def _forward_yolo_train():
     """启动 YOLO 训练。"""
     try:
-        from yolo_train import main as m
+        from .yolo_train import main as m
         m()
     except ImportError as e:
         print(f"❌ 导入失败: {e}")
@@ -170,8 +173,8 @@ def _forward_yolo_train():
 
 def _forward_detect(extra_args: list):
     """启动 YOLO 推理（detect.py 自带 PySide6 GUI）。"""
-    sys.argv = ["detect.py"] + extra_args
-    from detect import main as m
+    sys.argv = ["-m", "ctts.detect"] + extra_args
+    from .detect import main as m
     m()
 
 
@@ -181,9 +184,6 @@ def _forward_detect(extra_args: list):
 
 def gui_main():
     """启动 CTTS 图形界面。"""
-    tools_dir = os.path.dirname(os.path.abspath(__file__))
-    if tools_dir not in sys.path:
-        sys.path.insert(0, tools_dir)
 
     try:
         from PySide6.QtCore import Qt, QThread, QTimer, Signal, QRectF, QPointF
@@ -205,28 +205,28 @@ def gui_main():
         else:
             venv_py = os.path.join(venv_dir, "bin", "python")
             activate = os.path.join(venv_dir, "bin", "activate")
-        setup_py = os.path.join(os.path.dirname(os.path.abspath(__file__)), "setup_env.py")
+        setup_py = os.path.join(_PROJECT_ROOT, "scripts", "setup_env.py")
         print("❌ 当前解释器没有 PySide6。")
         print(f"   当前: {sys.executable}")
         print("首次使用请先初始化环境：")
         print(f'   "{sys.executable}" "{setup_py}"')
         print("初始化完成后启动 GUI：")
-        print(f'   "{venv_py}" "{os.path.abspath(__file__)}" --gui')
+        print(f'   "{venv_py}" -m ctts --gui')
         if os.path.isfile(venv_py):
             print("或先激活：")
             print(f'   {activate}')
-            print("   python ctts.py --gui")
+            print("   python -m ctts --gui")
         sys.exit(1)
 
     try:
-        from label_studio_auth import (
+        from .label_studio_auth import (
             DEFAULT_BASE_URL,
             get_client,
             reset_clients,
             resolve_base_url,
         )
-        from label_studio_project import list_projects, create_project, delete_project
-        from label_studio_data import list_tasks, delete_tasks_batch, task_stats, import_tasks_from_images
+        from .label_studio_project import list_projects, create_project, delete_project
+        from .label_studio_data import list_tasks, delete_tasks_batch, task_stats, import_tasks_from_images
         _ls_import_error = None
     except Exception as e:
         _ls_import_error = e
@@ -558,7 +558,7 @@ def gui_main():
             )
 
         def _do_build(self, log, videos, output, interval, lap, ent, min_b, max_b):
-            from dataset_build import collect_videos, extract_frames
+            from .dataset_build import collect_videos, extract_frames
             all_videos = collect_videos(videos)
             log(f"找到 {len(all_videos)} 个视频\n")
             for i, v in enumerate(all_videos):
@@ -617,7 +617,7 @@ def gui_main():
 
         def _do_split(self, log, path, ratio):
             import io
-            from split_dataset import split_dataset
+            from .split_dataset import split_dataset
             from pathlib import Path
             buf = io.StringIO()
             old = sys.stdout
@@ -639,7 +639,7 @@ def gui_main():
 
         def _do_split_dry(self, log, path, ratio):
             import io
-            from split_dataset import split_dataset
+            from .split_dataset import split_dataset
             from pathlib import Path
             buf = io.StringIO()
             old = sys.stdout
@@ -1449,7 +1449,7 @@ def gui_main():
 
         def _pre_refresh_models(self):
             try:
-                from prelabel import RUN_ROOT
+                from .prelabel import RUN_ROOT
             except Exception:
                 return
             current = self._pre_model.currentData()
@@ -1482,7 +1482,7 @@ def gui_main():
             project_id = self._pre_project.value()
 
             def fn(log, on_event):
-                from prelabel import assess_project
+                from .prelabel import assess_project
                 return assess_project(project_id, client=self.client,
                                       log=log).to_dict()
             return fn
@@ -1505,7 +1505,7 @@ def gui_main():
             device = self._pre_device_value()
 
             def fn(log, on_event):
-                from prelabel import run_pipeline
+                from .prelabel import run_pipeline
                 return run_pipeline(
                     project_id, base_weights=weights, epochs=epochs,
                     imgsz=imgsz, conf=conf, iou=iou, freeze=freeze,
@@ -1525,7 +1525,7 @@ def gui_main():
             model = self._pre_model.currentData()
             if not model:
                 try:
-                    from prelabel import RUN_ROOT
+                    from .prelabel import RUN_ROOT
                     models = sorted(RUN_ROOT.glob("*/model/*.onnx"))
                 except Exception:
                     models = []
@@ -1535,7 +1535,7 @@ def gui_main():
                 model = str(models[-1])
 
             def fn(log, on_event):
-                from prelabel import prelabel_project, tag_from_manifest, make_tag
+                from .prelabel import prelabel_project, tag_from_manifest, make_tag
                 tag = tag_from_manifest(model, imgsz) or make_tag("manual", imgsz)
                 return prelabel_project(
                     project_id, model=model, tag=tag, conf=conf, iou=iou,
@@ -1721,7 +1721,7 @@ def gui_main():
             path = self._pre_last_run_dir
             if not path:
                 try:
-                    from prelabel import RUN_ROOT
+                    from .prelabel import RUN_ROOT
                 except Exception:
                     return
                 dirs = sorted(RUN_ROOT.glob("*/")) if RUN_ROOT.exists() else []
@@ -1749,7 +1749,7 @@ def gui_main():
 
             def do_export():
                 import csv
-                from label_studio_data import list_tasks
+                from .label_studio_data import list_tasks
                 tasks = list_tasks(project_id, page=1, page_size=1000,
                                    client=self.client)
                 by_task: dict[int, list] = {}
@@ -1859,7 +1859,7 @@ def gui_main():
         def _do_train(self, log, weights, data, epochs, batch, imgsz, device,
                       overrides):
             import io
-            from yolo_train import run_training
+            from .yolo_train import run_training
             log(f"🚀 启动训练: {weights}\n")
             buf = io.StringIO()
             old = sys.stdout
@@ -1921,7 +1921,7 @@ def gui_main():
                 return
 
             # 构建参数
-            argv = ["detect.py", "-w", weights, "--conf", str(conf)]
+            argv = ["-m", "ctts.detect", "-w", weights, "--conf", str(conf)]
             if source == 0:
                 argv += ["--cam", "0"]
             elif source == 1:
@@ -1935,9 +1935,12 @@ def gui_main():
             # 在新进程中启动（detect.py 自带 QApplication，不能嵌套）
             import subprocess
             python = sys.executable
+            _env = dict(os.environ)
+            _env["PYTHONPATH"] = os.path.join(_PROJECT_ROOT, "src") + os.pathsep + _env.get("PYTHONPATH", "")
             proc = subprocess.Popen(
                 [python] + argv,
-                cwd=os.path.dirname(os.path.abspath(__file__)),
+                cwd=_PROJECT_ROOT,
+                env=_env,
                 stderr=subprocess.PIPE, stdout=subprocess.PIPE,
             )
             # 短暂等待以捕获立即崩溃
@@ -2126,7 +2129,7 @@ def gui_main():
             _set_status(self._rv_status, "加载中…", "warn")
 
             def fn():
-                from review import scan_review
+                from .review import scan_review
                 return scan_review(pid, version=version,
                                    only_unlabeled=only_unlabeled,
                                    client=self.client)
@@ -2474,7 +2477,7 @@ def gui_main():
             _set_status(self._rv_status, f"认可 {len(chosen)} 条…", "warn")
 
             def fn():
-                from review import accept_items
+                from .review import accept_items
                 return accept_items(pid, chosen, selections=selections,
                                     client=self.client)
 
@@ -2656,7 +2659,7 @@ def gui_main():
             edit.setPlainText(json.dumps(data, ensure_ascii=False, indent=2))
 
         def _advanced_overrides(self, edit, label):
-            from train_args import OverrideError, parse_json_text
+            from .train_args import OverrideError, parse_json_text
             try:
                 overrides, ignored = parse_json_text(edit.toPlainText())
             except OverrideError as e:
@@ -2668,14 +2671,14 @@ def gui_main():
             return overrides
 
         def _train_advanced_defaults(self):
-            from train_args import MANAGED_KEYS
-            from yolo_train import DEFAULT_TRAIN_ARGS
+            from .train_args import MANAGED_KEYS
+            from .yolo_train import DEFAULT_TRAIN_ARGS
             return {k: v for k, v in DEFAULT_TRAIN_ARGS.items()
                     if k not in MANAGED_KEYS}
 
         def _pre_advanced_defaults(self):
-            from prelabel import default_train_args
-            from train_args import MANAGED_KEYS
+            from .prelabel import default_train_args
+            from .train_args import MANAGED_KEYS
             defaults = default_train_args(self._pre_device_value())
             return {k: v for k, v in defaults.items() if k not in MANAGED_KEYS}
 
