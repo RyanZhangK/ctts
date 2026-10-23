@@ -34,3 +34,10 @@ uv.lock
 
 # Label Studio
 *.sqlite3
+
+# 模型权重与导出产物（仓根）
+weight/
+weights/
+*.pt
+*.onnx
+*.engine

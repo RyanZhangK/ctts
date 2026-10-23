@@ -1,0 +1,77 @@
+# foray_ml CI —— 基于组织模板（ZQU-Foray/.github → workflows/ci-template.yml）裁剪。
+# 纯 Python 仓：保留 lint / test 两个作业；无 C/C++、无 ROS 2 包，对应作业已删除。
+# 设计原则：空仓库必须绿灯——作业内探测目标文件，不存在即跳过。
+
+name: CI
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+
+jobs:
+  lint-python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 检测是否存在 Python 代码
+        id: detect
+        shell: bash
+        run: |
+          if find . -name '*.py' -not -path './.git/*' | grep -q .; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "未发现 Python 代码，跳过。"
+          fi
+
+      - name: Set up Python
+        if: steps.detect.outputs.found == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install ruff
+        if: steps.detect.outputs.found == 'true'
+        run: pip install ruff
+
+      # 只查语法级错误（E9/F63/F7/F82），避免一次性引入全量风格噪音
+      - name: Lint with ruff
+        if: steps.detect.outputs.found == 'true'
+        run: ruff check --select E9,F63,F7,F82 .
+
+  test-python:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 检测是否存在 Python 测试
+        id: detect
+        shell: bash
+        run: |
+          if find . \( -name 'test_*.py' -o -name '*_test.py' \) \
+               -not -path './.git/*' | grep -q .; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "未发现 Python 测试，跳过。"
+          fi
+
+      - name: Set up Python
+        if: steps.detect.outputs.found == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        if: steps.detect.outputs.found == 'true'
+        shell: bash
+        run: |
+          pip install --no-deps -e .
+          pip install -e ".[ci]"
+
+      - name: Run tests
+        if: steps.detect.outputs.found == 'true'
+        run: pytest -v

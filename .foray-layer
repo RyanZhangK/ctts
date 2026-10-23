@@ -1,0 +1,9 @@
+# 本仓在算法结构中的位置
+# 见 foray_docs/algorithm_structure.md §1
+#
+# layer: T = 离线工具层（训练 / 数据 / 导出 / 评估）。
+# 不在 X2/L1–L5 实时链路内，不参与 ROS 2 colcon 构建，不被任何实时仓代码依赖；
+# 产出物（权重 / ONNX / model_contract.yaml）由 foray_vision 等仓按契约消费。
+
+layer: T
+depends_on_layers: []
