@@ -10,12 +10,15 @@
 - [ ] CI 首次绿灯验证（ruff/pytest，Python 3.11/3.12）
 - [ ] 补齐单元测试：`dataset_build` / `split_dataset` / `label_studio_*` / `yolo_train`
 - [ ] 双流特征解耦模型实验（见 `foray_docs/dual_stream_disentanglement.md`），结论回写该文档
+  - [x] 骨架：`models/color.py`（YUV 4:2:0）+ `models/dualstream.py`（双主干/门控/属性双头）+ 单测
+  - [ ] 属性标签格式定稿（颜色 4 类 + 图案 9 类）
+  - [ ] E0–E5 消融实验与判据记录
 - [ ] 模型契约 `model_contract.yaml` 定稿（输入 layout / 类别映射 / opset）
 - [ ] 在 `foray_ws` 的 `.repos` 中 pin 本仓（`ml/` 目录，不进 colcon 构建）
 
 ## 当前 Agent State
 
-MIGRATED
+DUALSTREAM_SKELETON
 
 ## Before Snapshot
 

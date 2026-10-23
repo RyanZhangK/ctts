@@ -62,6 +62,16 @@ ctts detect --cam 0
 
 未安装时可用模块方式运行（需 `PYTHONPATH=src`）：`python3 -m ctts --help`。
 
+## 实验区
+
+`experiments/` 存放**结构实验**，不进 CLI 主流程、不作为交付物。当前只有一个：
+
+- `experiments/dualstream/` —— 双流特征解耦（亮度全分辨率无颜色 + 色度半分辨率有颜色 → 门控融合 → 颜色/图案双头）。背景见 [`foray_docs/dual_stream_disentanglement.md`](../foray_docs/dual_stream_disentanglement.md)，骨架在 `src/ctts/models/`，烟雾测试：
+
+  ```bash
+  python3 experiments/dualstream/train_dualstream.py --dry-run
+  ```
+
 ## 目录结构
 
 ```text
@@ -75,9 +85,11 @@ foray_ml/
 │   ├── prelabel.py         小模型预标注流水线
 │   ├── review.py           复核页（批次认可）
 │   ├── label_studio_*.py   Label Studio 认证 / 项目 / 任务 API
-│   └── detect.py           实时推理（PySide6 GUI）
+│   ├── detect.py           实时推理（PySide6 GUI）
+│   └── models/             模型与数据通路（color / dualstream）
 ├── tests/                  纯逻辑单元测试（无 GPU / 无网络）
 ├── scripts/                环境初始化与启动脚本（跨平台）
+├── experiments/            结构实验（dualstream）
 ├── docs/                   设计文档
 ├── dataset/                标注定义（data.yaml / classes.txt），不含图片
 └── weight/                 本地权重（gitignored）

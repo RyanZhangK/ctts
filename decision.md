@@ -43,3 +43,11 @@
 
 - `_PROJECT_ROOT` 由 `__file__` 上溯三级（`src/ctts/x.py` → 仓根），用于 `scripts/`、`dataset/`、`weight/` 等。
 - GUI 启动 `detect` 子进程改用 `python -m ctts.detect`，并以仓根为 cwd、注入 `PYTHONPATH=src`。
+
+## D-009 双流实验骨架放在本仓（不新建仓）
+
+- **决策**：双流特征解耦的模型骨架与实验脚本放 `src/ctts/models/` + `experiments/dualstream/`，不新建 `foray_dualstream` 仓。
+- **理由**：按 `foray_docs/repository_structure.md` §4「拆仓是因为痛了才拆」，双流是一个实验分支而非独立生命周期；仓级切分应在验证成立后进行（届时若需要独立产线再拆）。
+- **门控初始化**：`GateFuse` 的门控权重置 0、偏置 -4（σ≈0.018），使训练初期输出≈亮度特征。目的是抑制「色度支路偷学图案」——这是双流方案最大的已知风险（见调研报告 §7）。
+- **属性头**：颜色 4 类与图案 9 类**各自 sigmoid**（BCE），不用 softmax——YOLO 原生 head 的 softmax 强制互斥，是「两类特征竞争」的根源之一。
+- **数据通路单一实现**：`models/color.py` 用 numpy 实现 BT.709 全范围 YUV，训练预处理与推理侧（`foray_vision`）都引用同一组系数，避免训练/部署色度域偏移。

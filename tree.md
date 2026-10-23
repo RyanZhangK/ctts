@@ -27,9 +27,12 @@
 │   ├── label_studio_project.py
 │   ├── label_studio_data.py
 │   ├── label_studio_main.py  LS CLI 入口
-│   └── detect.py             实时推理（PySide6 GUI）
+│   ├── detect.py             实时推理（PySide6 GUI）
+│   └── models/               模型与数据通路（color: numpy 4:2:0；dualstream: torch 双流骨架）
 ├── tests/                    纯逻辑单元测试（test_prelabel / test_review）
 ├── scripts/                  环境初始化与 GUI 启动脚本（.sh/.cmd/.ps1）
+├── experiments/              结构实验（不进 CLI 主流程）
+│   └── dualstream/           双流特征解耦骨架与说明
 ├── docs/                     设计文档与截图
 └── dataset/                  标注定义（*.yaml / classes.txt），不含图片
 ```
