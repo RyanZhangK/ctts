@@ -3,7 +3,13 @@ from __future__ import annotations
 
 import unittest
 
-from ctts import review
+import pytest
+
+# 集成层依赖：未安装时整文件跳过（CI 的 [ci] extras 会装上）
+pytest.importorskip("httpx")
+pytest.importorskip("label_studio_sdk")
+
+from ctts import review  # noqa: E402
 
 
 def _box(label="object", score=0.9, x=10.0):

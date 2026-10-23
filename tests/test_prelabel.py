@@ -2,7 +2,9 @@
 """prelabel.py 纯逻辑单元测试（无 Label Studio / 无 GPU / 无网络）。
 
 运行:
-  cd tools && python -m unittest test_prelabel -v
+  PYTHONPATH=src python3 -m pytest tests/test_prelabel.py -v
+
+未安装 httpx / label-studio-sdk 时整文件跳过。
 """
 
 import json
@@ -12,8 +14,13 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
-from ctts import prelabel as P
+# 集成层依赖：未安装时整文件跳过（CI 的 [ci] extras 会装上）
+pytest.importorskip("httpx")
+pytest.importorskip("label_studio_sdk")
+
+from ctts import prelabel as P  # noqa: E402
 
 
 CFG_XML_STB = (
