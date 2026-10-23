@@ -12,6 +12,9 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 from typing import Callable, Iterable
+from urllib.parse import urlparse
+
+import httpx
 
 from label_studio_auth import get_client
 
@@ -140,11 +143,16 @@ def accept_items(project_id: int, items: Iterable[ReviewTask], *,
                  client=None, on_event=None,
                  log: Callable[[str], None] | None = None,
                  should_stop: Callable[[], bool] | None = None) -> dict:
-    """把选中的预测框写成 annotation（每个 task 一条）。"""
+    """把选中的预测框写成 annotation（每个 task 一条）。
+
+    返回统计里的 ``skipped_ids`` 只包含「已有标注而跳过」的任务：
+    它们在待复核列表里也不该再出现，调用方可以直接从列表移除。
+    用户主动不选任何框的任务不算在内。
+    """
     c = client or get_client()
     items = list(items)
     stats = {"accepted": 0, "skipped": 0, "failed": 0, "boxes": 0,
-             "accepted_ids": [], "errors": []}
+             "accepted_ids": [], "skipped_ids": [], "errors": []}
     started = time.time()
     _emit(on_event, "accept", "start", f"认可 {len(items)} 条…")
 
@@ -153,6 +161,7 @@ def accept_items(project_id: int, items: Iterable[ReviewTask], *,
             raise RuntimeError("已取消")
         if item.is_labeled or item.annotations:
             stats["skipped"] += 1
+            stats["skipped_ids"].append(item.task_id)
             continue
         result = item.selected_result(
             (selections or {}).get(item.task_id))
@@ -165,6 +174,7 @@ def accept_items(project_id: int, items: Iterable[ReviewTask], *,
             if bool(getattr(task, "is_labeled", False)) or int(
                     getattr(task, "total_annotations", 0) or 0):
                 stats["skipped"] += 1
+                stats["skipped_ids"].append(item.task_id)
                 continue
             c.annotations.create(
                 item.task_id,
@@ -191,3 +201,33 @@ def accept_items(project_id: int, items: Iterable[ReviewTask], *,
           1.0)
     stats["elapsed"] = round(time.time() - started, 1)
     return stats
+
+
+def task_image_url(client, task_id: int) -> str:
+    """读取任务的图片地址；相对路径按 Label Studio base_url 补全。"""
+    task = client.tasks.get(task_id)
+    data = getattr(task, "data", None) or {}
+    image = str(data.get("image") or "").strip()
+    if not image:
+        raise ValueError(f"任务 {task_id} 没有图片地址")
+    base = str(getattr(client, "base_url", "") or "").rstrip("/")
+    if image.startswith("/") and base:
+        image = base + image
+    return image
+
+
+def fetch_image_bytes(client, url: str, *, timeout: float = 20.0) -> bytes:
+    """下载任务图片；仅对 Label Studio 同源地址附带 API Token。"""
+    if not url:
+        raise ValueError("图片地址为空")
+    base = str(getattr(client, "base_url", "") or "")
+    headers = {}
+    try:
+        same_origin = urlparse(url).netloc == urlparse(base).netloc
+    except ValueError:
+        same_origin = True
+    if same_origin and hasattr(client, "auth_headers"):
+        headers = client.auth_headers()
+    resp = httpx.get(url, headers=headers, timeout=timeout, follow_redirects=True)
+    resp.raise_for_status()
+    return resp.content

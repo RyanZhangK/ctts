@@ -2040,7 +2040,7 @@ def gui_main():
             ops.addStretch()
             self._rv_accept_btn = QPushButton("认可选中")
             self._rv_accept_btn.setStyleSheet(PRIMARY_BTN_QSS)
-            self._rv_accept_btn.clicked.connect(self._rv_accept)
+            self._rv_accept_btn.clicked.connect(lambda: self._rv_accept())
             ops.addWidget(self._rv_accept_btn)
             self._rv_accept_batch_btn = QPushButton("认可本批全部")
             self._rv_accept_batch_btn.setStyleSheet(PRIMARY_BTN_QSS)
@@ -2048,7 +2048,8 @@ def gui_main():
             ops.addWidget(self._rv_accept_batch_btn)
             bl.addLayout(ops)
             hint = QLabel("勾选任务后点“认可选中”；点“认可本批全部”一键认可当前批次；"
-                          "默认认可该任务全部预测框，可先用“调整选中框…”只保留部分框。")
+                          "默认认可该任务全部预测框，可先用“调整选中框…”只保留部分框。"
+                          "已被标注过的任务不会重复认可，认可后直接从待复核列表移出。")
             hint.setStyleSheet(MUTED_QSS)
             bl.addWidget(hint)
             layout.addWidget(grp2)
@@ -2089,6 +2090,7 @@ def gui_main():
             self._rv_canvas.set_message("选择任务查看预测框预览")
             self._rv_preview_info.setText("选择任务查看预测框预览")
             self._rv_accept_btn.setEnabled(False)
+            self._rv_accept_batch_btn.setEnabled(False)
             _set_status(self._rv_status, "筛选条件已变化，点击“加载”", "warn")
 
         def _rv_project_changed(self, pid: int):
@@ -2212,7 +2214,13 @@ def gui_main():
             else:
                 self._rv_canvas.set_message("本批没有任务")
                 self._rv_preview_info.setText("—")
+            self._rv_sync_action_buttons()
+
+        def _rv_sync_action_buttons(self):
+            """按当前勾选/批次/忙碌状态统一刷新两个认可按钮。"""
             self._rv_accept_btn.setEnabled(bool(self._rv_checked) and not self._rv_busy)
+            self._rv_accept_batch_btn.setEnabled(
+                bool(self._rv_page_items()) and not self._rv_busy)
 
         def _rv_item_changed(self, item: QTableWidgetItem):
             if item.column() != 0:
@@ -2224,21 +2232,28 @@ def gui_main():
                 self._rv_checked.add(int(tid))
             else:
                 self._rv_checked.discard(int(tid))
-            self._rv_accept_btn.setEnabled(bool(self._rv_checked) and not self._rv_busy)
+            self._rv_sync_action_buttons()
             if self._rv_items:
                 self._rv_batch_info.setText(
                     f"第 {self._rv_batch + 1}/{self._rv_pages()} 批 · 本批 "
                     f"{len(self._rv_page_items())} 条 · 已勾选 {len(self._rv_checked)} 条 · "
                     f"共 {len(self._rv_items)} 条")
 
-        def _rv_select_page(self):
-            for item in self._rv_page_items():
-                self._rv_checked.add(item.task_id)
+        def _rv_set_page_checked(self, checked: bool) -> set[int]:
+            """勾选/取消勾选当前批次，返回本批任务 id。"""
+            ids = {item.task_id for item in self._rv_page_items()}
+            if checked:
+                self._rv_checked |= ids
+            else:
+                self._rv_checked -= ids
             self._rv_render()
+            return ids
+
+        def _rv_select_page(self):
+            self._rv_set_page_checked(True)
 
         def _rv_select_none(self):
-            self._rv_checked.clear()
-            self._rv_render()
+            self._rv_set_page_checked(False)
 
         def _rv_current_item(self):
             row = self._rv_table.currentRow()
@@ -2424,17 +2439,22 @@ def gui_main():
             webbrowser.open(f"{base}/projects/{pid}/data?task={item.task_id}")
 
         def _rv_accept_batch(self):
-            """勾选当前页全部任务并提交。"""
+            """勾选当前页全部任务并提交（只认可本批）。"""
             if not self._rv_items:
                 QMessageBox.information(self, "提示", "请先加载复核数据。")
                 return
-            self._rv_check_page(True)
-            self._rv_accept()
+            page_ids = self._rv_set_page_checked(True)
+            if not page_ids:
+                QMessageBox.information(self, "提示", "本批没有任务。")
+                return
+            self._rv_accept(only=page_ids)
 
-        def _rv_accept(self):
+        def _rv_accept(self, only: set[int] | None = None):
             if self._rv_client() is None or self._rv_busy:
                 return
-            chosen = [i for i in self._rv_items if i.task_id in self._rv_checked]
+            chosen = [i for i in self._rv_items
+                      if i.task_id in self._rv_checked
+                      and (only is None or i.task_id in only)]
             if not chosen:
                 QMessageBox.information(self, "提示", "没有勾选任何任务。")
                 return
@@ -2449,7 +2469,7 @@ def gui_main():
             selections = {it.task_id: self._rv_box_sel[it.task_id]
                           for it in chosen if it.task_id in self._rv_box_sel}
             self._rv_busy = True
-            self._rv_accept_btn.setEnabled(False)
+            self._rv_sync_action_buttons()
             self._rv_load_btn.setEnabled(False)
             _set_status(self._rv_status, f"认可 {len(chosen)} 条…", "warn")
 
@@ -2461,16 +2481,21 @@ def gui_main():
             def done(stats):
                 self._rv_busy = False
                 accepted = set(stats.get("accepted_ids") or [])
-                self._rv_items = [i for i in self._rv_items if i.task_id not in accepted]
-                for tid in accepted:
+                # 已被别处标注过的任务也不会再出现在待复核列表，一并移除。
+                gone = accepted | set(stats.get("skipped_ids") or [])
+                self._rv_items = [i for i in self._rv_items if i.task_id not in gone]
+                for tid in gone:
                     self._rv_checked.discard(tid)
                     self._rv_box_sel.pop(tid, None)
-                self._rv_batch = min(self._rv_batch, self._rv_pages() - 1)
+                self._rv_batch = max(0, min(self._rv_batch, self._rv_pages() - 1))
                 self._rv_render()
                 self._rv_load_btn.setEnabled(True)
-                _set_status(self._rv_status,
-                            f"认可 {stats.get('accepted', 0)} 条，跳过 "
-                            f"{stats.get('skipped', 0)}，失败 {stats.get('failed', 0)}",
+                dropped = len(gone) - len(accepted)
+                status = (f"认可 {stats.get('accepted', 0)} 条，跳过 "
+                          f"{stats.get('skipped', 0)}，失败 {stats.get('failed', 0)}")
+                if dropped:
+                    status += f"（{dropped} 条已标注，移出列表）"
+                _set_status(self._rv_status, status,
                             "ok" if not stats.get("failed") else "warn")
                 QMessageBox.information(
                     self, "复核完成",
@@ -2480,10 +2505,15 @@ def gui_main():
                     self._log_append("❌ 部分任务认可失败：")
                     for err in stats["errors"]:
                         self._log_append(f"  任务 {err['task_id']}: {err['error']}")
+                if not self._rv_items:
+                    _set_status(self._rv_status,
+                                f"{status}；本次已全部处理完，可点“加载”获取新任务",
+                                "ok" if not stats.get("failed") else "warn")
 
             def failed(_e):
                 self._rv_busy = False
                 self._rv_load_btn.setEnabled(True)
+                self._rv_sync_action_buttons()
                 _set_status(self._rv_status, "认可失败", "err")
 
             self._run_task(fn, done, "认可复核结果", on_error=failed)

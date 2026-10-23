@@ -120,6 +120,17 @@ class AcceptReviewTest(unittest.TestCase):
         self.assertEqual(stats["skipped"], 1)
         self.assertEqual(stats["accepted"], 1)
         self.assertEqual(stats["accepted_ids"], [2])
+        # 已标注的任务同时出现在 skipped_ids 里，调用方据此移出待复核列表。
+        self.assertEqual(stats["skipped_ids"], [1])
+
+    def test_empty_selection_is_not_skipped_id(self):
+        """用户主动不选框 → 跳过但保留在待复核列表，不返回 skipped_ids。"""
+        client = _Client([_Pred(1, 1, boxes=2)], [_Task(1)])
+        items = review.scan_review(1, client=client)
+        stats = review.accept_items(1, items, selections={1: []}, client=client)
+        self.assertEqual(stats["skipped"], 1)
+        self.assertEqual(stats["accepted"], 0)
+        self.assertEqual(stats["skipped_ids"], [])
 
     def test_error_is_collected(self):
         client = _Client([_Pred(1, 1)], [_Task(1)], fail_on=[1])
