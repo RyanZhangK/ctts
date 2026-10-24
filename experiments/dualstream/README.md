@@ -8,11 +8,13 @@
 
 ## 当前状态
 
-骨架已就绪，**尚未接入数据集**：
+骨架、数据通路与属性训练已就绪（标签格式采用**方案 A**，见下节）：
 
 - `src/ctts/models/color.py` —— YUV 4:2:0 通路（numpy，训练/推理共享同一组系数）
 - `src/ctts/models/dualstream.py` —— 非对称双主干 + 门控融合 + 属性双头（torch）
-- `tests/test_color.py`、`tests/test_dualstream.py` —— 无 GPU 单测（后者在无 torch 环境自动跳过）
+- `src/ctts/models/dataset.py` —— 属性数据集（`labels_attr/` 解析、图像级/实例级两种视图）
+- `model_contract.yaml` —— 对下游推理仓的接口约定（输入 layout / 类别映射 / 导出）
+- `tests/` —— 无 GPU 单测（torch 缺失时相关用例自动跳过）
 
 ## 运行
 
@@ -20,9 +22,25 @@
 # 结构 / 梯度烟雾测试（无需数据与 GPU）
 python3 experiments/dualstream/train_dualstream.py --dry-run
 
+# 属性分类训练（数据集需含 labels_attr/）
+python3 experiments/dualstream/train_dualstream.py --data /path/to/dataset --epochs 50
+
 # 单测
-PYTHONPATH=src python3 -m pytest tests/test_color.py tests/test_dualstream.py -v
+PYTHONPATH=src python3 -m pytest tests/ -v
 ```
+
+## 标签格式（方案 A）
+
+颜色与图案是**属性**，不展开成 4×9 组合类（展开正是「颜色捷径压制图案」的根源）。
+
+- `labels/` 仍是标准 YOLO 5 字段，`ultralytics` 可直接用，**不破坏现有标注流程**；
+- `labels_attr/` 按图片同名存放属性：每行 `<cls> <cx> <cy> <w> <h> <color> <pattern>`，
+  颜色/图案写类别名（`red`/`blue`/`extinguish`/`purple`、`one`…`not_armor`），未知写 `-`。
+
+类别名与 `sp_vision_25/tasks/auto_aim/armor.hpp` 的枚举一致：颜色 4 类、图案 9 类。
+
+训练采用**图像级**视图（取面积最大框的属性），适用于裁剪 patch / ROI 数据集；
+一张图内出现多个不同属性目标时训练脚本会告警，此时应改用实例级标签或先裁剪。
 
 ## 实验矩阵（待跑）
 
@@ -41,9 +59,16 @@ PYTHONPATH=src python3 -m pytest tests/test_color.py tests/test_dualstream.py -v
 2. 图案准确率相对 E0 有可复现提升；
 3. 色度支路对图案区域的响应不显著高于随机（检验「色度支路泄题」）。
 
-## 待定项
+## 已定 / 待定
 
-- **属性标签格式**：`data.yaml` 里如何表达「颜色 4 类 + 图案 9 类」两套标签（同图多标签 vs 组合类展开），需与数据准备脚本一起定；
-- **域一致性**：训练时若用 4:2:0 预处理，推理（`foray_vision`）必须一致，否则线上分布偏移；
-- **反事实增强**：R↔B 通道交换（不是 HSV 旋转）用于生成「颜色对调」样本，已实现 `color.swap_rb`；
-- **导出契约**：ONNX 双输入（`y`, `cbcr`）→ TensorRT 多 binding，需写入 `model_contract.yaml`。
+已定：
+
+- **属性标签格式 = 方案 A**（`labels_attr/` 并行文件，见上节）；
+- **反事实增强**：R↔B 通道交换（不是 HSV 旋转），`color.swap_rb` 已实现；
+- **导出契约**：`model_contract.yaml` 已给出输入 layout、类别映射、ONNX/TensorRT 约定。
+
+待定：
+
+- **域一致性**：训练与推理都必须走 `color.py` 的同一套 4:2:0 通路（`foray_vision` 侧待接）；
+- **属性标注工具**：`labels_attr/` 目前需由标注脚本生成，尚未接入 Label Studio 导出；
+- **类别不平衡**：extinguish / not_armor 样本可能偏少，需统计后再决定是否加权。

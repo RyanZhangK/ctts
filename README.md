@@ -69,8 +69,15 @@ ctts detect --cam 0
 - `experiments/dualstream/` —— 双流特征解耦（亮度全分辨率无颜色 + 色度半分辨率有颜色 → 门控融合 → 颜色/图案双头）。背景见 [`foray_docs/dual_stream_disentanglement.md`](../foray_docs/dual_stream_disentanglement.md)，骨架在 `src/ctts/models/`，烟雾测试：
 
   ```bash
+  # 结构烟雾测试（无数据、无 GPU）
   python3 experiments/dualstream/train_dualstream.py --dry-run
+
+  # 属性训练（数据集需含 labels_attr/，格式见 experiments/dualstream/README.md）
+  python3 experiments/dualstream/train_dualstream.py --data /path/to/dataset --epochs 50
   ```
+
+  属性标签采用方案 A：`labels/` 保持 YOLO 5 字段兼容，属性放 `labels_attr/` 并行文件；
+  对外接口约定见 `experiments/dualstream/model_contract.yaml`。
 
 ## 目录结构
 

@@ -51,3 +51,16 @@
 - **门控初始化**：`GateFuse` 的门控权重置 0、偏置 -4（σ≈0.018），使训练初期输出≈亮度特征。目的是抑制「色度支路偷学图案」——这是双流方案最大的已知风险（见调研报告 §7）。
 - **属性头**：颜色 4 类与图案 9 类**各自 sigmoid**（BCE），不用 softmax——YOLO 原生 head 的 softmax 强制互斥，是「两类特征竞争」的根源之一。
 - **数据通路单一实现**：`models/color.py` 用 numpy 实现 BT.709 全范围 YUV，训练预处理与推理侧（`foray_vision`）都引用同一组系数，避免训练/部署色度域偏移。
+
+## D-010 属性标签采用方案 A（`labels_attr/` 并行文件）
+
+- **决策**（2026-10-24 拍板）：颜色 4 类与图案 9 类作为**属性**独立标注，不展开成 4×9 组合类。
+  - `labels/` 保持标准 YOLO 5 字段，`ultralytics` 可直接使用，不破坏现有标注产物；
+  - `labels_attr/` 按图同名存放 `<cls> <cx> <cy> <w> <h> <color> <pattern>`，颜色/图案写类别名，未知写 `-`。
+- **理由**：组合类展开会让模型在 36 个互斥类上学 softmax，正是「颜色捷径压制图案」的根源；
+  属性独立监督（sigmoid + BCE）让颜色与图案各自有独立梯度通路。
+- **类别名来源**：与 `sp_vision_25/tasks/auto_aim/armor.hpp` 一致（COLORS 4 类、ARMOR_NAMES 9 类）。
+- **图像级视图**：训练脚本取面积最大框的属性作为整图属性；多属性目标会告警，
+  提示改用实例级标签或先裁剪。实例级数据通路（`AttrDataset(level="instance")`）已预留。
+- **契约**：`experiments/dualstream/model_contract.yaml` 固化输入 layout、类别映射、阈值与导出参数；
+  改契约属破坏性接口变更，须在此留痕并通知 `foray_vision`。

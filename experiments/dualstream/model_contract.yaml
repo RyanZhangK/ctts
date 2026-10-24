@@ -1,0 +1,74 @@
+# 模型契约（model_contract/v1）
+#
+# 本文件是 foray_ml 对下游推理仓（foray_vision 等）的**唯一接口约定**。
+# 修改任何字段都属于破坏性接口变更：必须在 decision.md 留痕，并同步通知下游。
+#
+# 约定要点：
+#   - 训练与推理必须走同一套 YUV 4:2:0 数据通路（ctts/models/color.py），
+#     否则色度支路会学到与部署时不一致的特征。
+#   - 颜色 4 类 / 图案 9 类各自 sigmoid（多标签），不是 softmax。
+
+schema: model_contract/v1
+name: dualstream_v0
+task: armor_attribute
+description: >
+  灯条颜色（队伍）× 装甲图案（兵种）双属性分类：亮度支路全分辨率学图案，
+  色度支路低分辨率学颜色，门控融合后由属性头分别输出。
+
+inputs:
+  # 下游按该 layout 喂入；模型内部用 ctts/models/color.py 拆出 Y 与 CbCr
+  bgr:
+    layout: [B, 3, H, W]
+    channel_order: BGR          # OpenCV / TensorRT 惯例，非 RGB
+    dtype: float32
+    range: [0.0, 1.0]           # 已归一化，不做 mean/std 减除
+    note: >
+      H/W 不固定（结构对尺寸无硬约束），但训练时的 letterbox 策略必须与部署一致；
+      训练默认 640×640。
+
+preprocess:
+  resize:
+    mode: letterbox             # 保持长宽比 + 灰边填充
+    size: [640, 640]
+    pad_value: 114
+  color_space:
+    internal: BT.709 full-range YUV
+    split: {y: [0, 1], cbcr: [-0.5, 0.5]}
+    chroma_subsample: "4:2:0"   # 色度支路半分辨率
+    source: ctts/models/color.py
+
+outputs:
+  color_logits:
+    shape: [B, 4]
+    activation: sigmoid
+    threshold: 0.5
+    labels: [red, blue, extinguish, purple]
+    note: >
+      多标签语义（互不排斥）：extinguish 表示灯条熄灭/未点亮。
+      推理取 argmax 时若全部 < threshold 则判为 unknown。
+  pattern_logits:
+    shape: [B, 9]
+    activation: sigmoid
+    threshold: 0.5
+    labels: [one, two, three, four, five, sentry, outpost, base, not_armor]
+
+postprocess:
+  combine: >
+    颜色与图案独立解码；对外输出 (color, pattern) 二元组。
+    not_armor 或颜色 unknown 时整条目标作废（交给跟踪器确认）。
+
+export:
+  onnx:
+    opset: 17
+    input_names: [bgr]
+    dynamic_axes: {bgr: {0: batch}}
+  tensorrt:
+    precision: fp16            # 色度支路可单独 INT8 量化（后续实验）
+    input_names: [bgr]
+
+labels:
+  format: >
+    labels/      标准 YOLO 5 字段（ultralytics 兼容）；
+    labels_attr/ 同图同名 `<cls> <cx> <cy> <w> <h> <color> <pattern>`，
+    颜色/图案写类别名，未知写 `-`。
+  source_of_truth: labels_attr/
